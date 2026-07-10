@@ -17,11 +17,11 @@
 
 | 方向 | 内容 |
 |------|------|
-| 注册引擎 | 切回 `dongguatanglinux/grok-build-auth` 协议栈；移除 DrissionPage / Chromium 浏览器注册 |
+| 注册引擎 | `dongguatanglinux/grok-build-auth` HTTP 协议注册（MoeMail + YesCaptcha） |
 | 注册稳定性 | 先打码再收邮箱验证码；`create_account` 错误码识别；CreateSession 回退；多线程批量注册 |
 | 中继兼容 | 剥离 `presence_penalty` / `frequency_penalty` 等上游不支持参数；reasoning → `<think>` content；SSE keepalive |
 | 管理台 | 账号搜索 / 多选 / 批量删除；注册数量 / 并发 / 启动间隔 |
-| Docker | 精简为协议依赖（无 chromium/xvfb） |
+| Docker | 协议依赖镜像（`curl_cffi` / `requests`） |
 
 ---
 
@@ -127,7 +127,7 @@ docker compose up -d --build
 ./docker-rebuild.sh
 ```
 
-镜像基于协议注册栈（`curl_cffi` / `requests`），**不需要** chromium / xvfb。
+镜像基于协议注册栈（`curl_cffi` / `requests`）。
 
 ### 默认地址
 
