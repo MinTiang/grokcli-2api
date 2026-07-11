@@ -49,7 +49,7 @@ from config import (
 import config as _config
 from models import load_models_from_cache, resolve_model
 
-APP_VERSION = "1.8.11"
+APP_VERSION = "1.8.12"
 
 
 def _on_startup() -> None:
@@ -802,6 +802,48 @@ def _coerce_tool_arguments(raw: Any) -> str:
         return str(raw)
 
 
+
+def _merge_tool_arguments(current: str, incoming: str) -> str:
+    """
+    Merge streamed tool argument fragments without double-append corruption.
+
+    OpenAI true deltas are pure suffixes. Secondary relays (sub2api / new-api)
+    often re-send the full cumulative JSON on later chunks or on the final
+    message; always-append would yield `{"file_path":"a"}{"file_path":"a"}`
+    and break Claude Code Read / Write (missing required fields after parse).
+    """
+    cur = current or ""
+    piece = incoming or ""
+    if not piece:
+        return cur
+    if not cur:
+        return piece
+    if piece == cur:
+        return cur
+    # Cumulative re-send / progressive full snapshot
+    if piece.startswith(cur):
+        return piece
+    # Shorter fragment already contained
+    if cur.startswith(piece):
+        return cur
+    # Both complete JSON and equal → ignore re-send
+    try:
+        import json as _json
+        a = _json.loads(cur)
+        b = _json.loads(piece)
+        if a == b:
+            return cur
+        # cur already a complete value; do not append another full JSON blob
+        if isinstance(a, (dict, list)) and isinstance(b, (dict, list)):
+            # Prefer the longer / later complete object rather than concat
+            return piece if len(piece) >= len(cur) else cur
+        if isinstance(a, (dict, list)):
+            return cur
+    except (TypeError, ValueError):
+        pass
+    # True delta fragment
+    return cur + piece
+
 def _merge_tool_name(current: str, incoming: str) -> str:
     """
     Merge function names from streamed deltas without double-append corruption.
@@ -947,9 +989,10 @@ def _merge_tool_call_delta(
                     entry["function"].get("name") or "", str(fn["name"])
                 )
             if fn.get("arguments") is not None:
-                entry["function"]["arguments"] = (
-                    entry["function"].get("arguments") or ""
-                ) + _coerce_tool_arguments(fn.get("arguments"))
+                entry["function"]["arguments"] = _merge_tool_arguments(
+                    entry["function"].get("arguments") or "",
+                    _coerce_tool_arguments(fn.get("arguments")),
+                )
         # some upstreams put name/arguments at top level
         elif raw.get("name") or raw.get("arguments") is not None:
             if raw.get("name"):
@@ -957,9 +1000,10 @@ def _merge_tool_call_delta(
                     entry["function"].get("name") or "", str(raw["name"])
                 )
             if raw.get("arguments") is not None:
-                entry["function"]["arguments"] = (
-                    entry["function"].get("arguments") or ""
-                ) + _coerce_tool_arguments(raw.get("arguments"))
+                entry["function"]["arguments"] = _merge_tool_arguments(
+                    entry["function"].get("arguments") or "",
+                    _coerce_tool_arguments(raw.get("arguments")),
+                )
 
 
 def _finalize_tool_calls(

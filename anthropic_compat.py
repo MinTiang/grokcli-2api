@@ -455,6 +455,7 @@ def map_finish_to_stop_reason(
 
 
 def _parse_tool_arguments(raw: Any) -> dict[str, Any]:
+    """Parse tool arguments; recover doubled JSON from secondary relays."""
     if raw is None:
         return {}
     if isinstance(raw, dict):
@@ -467,6 +468,25 @@ def _parse_tool_arguments(raw: Any) -> dict[str, Any]:
             parsed = json.loads(s)
             return parsed if isinstance(parsed, dict) else {"value": parsed}
         except json.JSONDecodeError:
+            # e.g. {"file_path":"a"}{"file_path":"a"} from re-sent full args
+            decoder = json.JSONDecoder()
+            try:
+                obj, idx = decoder.raw_decode(s)
+                if isinstance(obj, dict):
+                    rest = s[idx:].strip()
+                    if not rest:
+                        return obj
+                    try:
+                        obj2, _ = decoder.raw_decode(rest)
+                        if obj2 == obj:
+                            return obj
+                    except json.JSONDecodeError:
+                        pass
+                    return obj
+                if isinstance(obj, dict):
+                    return obj
+            except json.JSONDecodeError:
+                pass
             return {"_raw": raw}
     return {"value": raw}
 
@@ -798,6 +818,40 @@ def anthropic_stream_ping() -> str:
     return _sse_event("ping", {"type": "ping"})
 
 
+
+def merge_tool_argument_delta(current: str, incoming: str) -> str:
+    """
+    Merge tool argument stream pieces (delta or cumulative re-send).
+
+    Secondary relays may re-broadcast the full arguments JSON; naive append
+    corrupts Claude Code tools (Read requires file_path, etc.).
+    """
+    cur = current or ""
+    piece = incoming or ""
+    if not piece:
+        return cur
+    if not cur:
+        return piece
+    if piece == cur:
+        return cur
+    if piece.startswith(cur):
+        return piece
+    if cur.startswith(piece):
+        return cur
+    try:
+        a = json.loads(cur)
+        b = json.loads(piece)
+        if a == b:
+            return cur
+        if isinstance(a, (dict, list)) and isinstance(b, (dict, list)):
+            return piece if len(piece) >= len(cur) else cur
+        if isinstance(a, (dict, list)):
+            return cur
+    except (TypeError, ValueError, json.JSONDecodeError):
+        pass
+    return cur + piece
+
+
 class AnthropicStreamAssembler:
     """
     Stateful converter: OpenAI chat.completion.chunk deltas → Anthropic SSE events.
@@ -955,7 +1009,10 @@ class AnthropicStreamAssembler:
                 elif raw.get("input") is not None:
                     args_piece = self._coerce_args_piece(raw.get("input"))
                 if args_piece:
-                    state["args"] += args_piece
+                    # Merge delta OR full re-send (double-proxy safe)
+                    state["args"] = merge_tool_argument_delta(
+                        state.get("args") or "", args_piece
+                    )
 
                 # Start tool_use as soon as we know the name (args may arrive later).
                 # Waiting for first args_piece caused intermittent client hangs when
@@ -969,24 +1026,19 @@ class AnthropicStreamAssembler:
                             name=state["name"],
                         )
                     )
-                    if state["args"]:
+                # Emit only the unsent suffix so cumulative re-sends do not
+                # duplicate partial_json (breaks Read file_path parsing).
+                if state["started"]:
+                    sent = int(state.get("args_sent") or 0)
+                    remaining = (state.get("args") or "")[sent:]
+                    if remaining:
                         events.append(
                             anthropic_stream_input_json_delta(
-                                state["block_index"], state["args"]
+                                state["block_index"], remaining
                             )
                         )
-                        state["args_sent"] = len(state["args"])
-                        self._output_chars += len(state["args"])
-                elif state["started"] and args_piece:
-                    events.append(
-                        anthropic_stream_input_json_delta(
-                            state["block_index"], args_piece
-                        )
-                    )
-                    state["args_sent"] = int(state.get("args_sent") or 0) + len(
-                        args_piece
-                    )
-                    self._output_chars += len(args_piece)
+                        state["args_sent"] = len(state.get("args") or "")
+                        self._output_chars += len(remaining)
 
         return events
 

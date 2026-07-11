@@ -2,7 +2,7 @@
 
 把 **Grok OIDC 登录态** 转成 **OpenAI / Anthropic 兼容 API**，并附带 Web 管理台：多 API Key、多账号轮询、设备码 / 导入 / 协议注册。
 
-**当前版本：v1.8.11**
+**当前版本：v1.8.12**
 
 - **独立运行**：不依赖本地 Grok CLI，不调用 `grok login` / 浏览器 OAuth
 - **协议注册**：内置 `grok-build-auth`（HTTP 协议，无需 Chromium）
@@ -14,20 +14,20 @@
 
 ---
 
-## 本次更新（v1.8.11）
+## 本次更新（v1.8.12）
 
 | 方向 | 内容 |
 |------|------|
-| 修复 | `think_tag` 兼容态在 reasoning/content 交替输出时，第二次及以后 `<think>` 无法闭合的问题 |
-| 说明 | 去掉 `_ReasoningCompatState.closed` 闩锁，只靠 `think_open` 控制开闭，交替流可正确 reopen/reclose |
-| 默认 | `GROK2API_REASONING_COMPAT` 仍为 `off`；仅在显式 `think_tag` 时写入正文标签 |
+| 修复 | 二次反代（Claude Code → sub2api → grokcli-2api）下 tool arguments 完整重发导致 JSON 拼接损坏 |
+| 影响 | Claude Code `Read` 等工具出现 `file_path` 缺失 / `InputValidationError` |
+| 处理 | OpenAI 累积与 Anthropic 流式均对 tool args 做 delta/累计去重；解析端恢复 `}{` 双份 JSON |
+| 模板 | `.env.example` + 启动脚本复制模板；默认 `REASONING_COMPAT=off` |
 
 ### 相关环境变量（可选）
 
 ```bash
+cp .env.example .env
 # off（默认）: reasoning 走 reasoning_content，正文不带 <think>
-# think_tag: 把 reasoning 包进 <think>...</think> 写入 content（兼容只读 content 的中继）
-# content: 合并 reasoning 到 content，不带标签
 GROK2API_REASONING_COMPAT=off
 ```
 
