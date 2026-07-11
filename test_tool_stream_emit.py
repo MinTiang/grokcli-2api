@@ -156,3 +156,36 @@ if __name__ == "__main__":
             fn()
             print("ok", name)
     print("ALL PASS")
+
+
+def test_normalize_strips_builtin_search_tools():
+    tools = [
+        {"type": "web_search"},
+        {"type": "live_search"},
+        {"type": "web_search_preview", "parameters": {"type": "object", "properties": {}}},
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "weather",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+            },
+        },
+    ]
+    out = app._normalize_tools(tools)
+    assert out is not None and len(out) == 1
+    assert out[0]["type"] == "function"
+    assert out[0]["function"]["name"] == "get_weather"
+
+
+def test_normalize_search_only_tools_becomes_none():
+    assert app._normalize_tools([{"type": "web_search"}, {"type": "live_search"}]) is None
+
+
+def test_normalize_tool_choice_search_to_auto():
+    assert app._normalize_tool_choice({"type": "web_search"}) == "auto"
+    assert app._normalize_tool_choice({"type": "live_search"}) == "auto"
+    assert app._normalize_tool_choice({"type": "function", "function": {"name": "x"}}) == {
+        "type": "function",
+        "function": {"name": "x"},
+    }

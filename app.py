@@ -50,7 +50,7 @@ import config as _config
 import history_compact
 from models import load_models_from_cache, resolve_model
 
-APP_VERSION = "1.8.24"
+APP_VERSION = "1.8.25"
 
 
 def _on_startup() -> None:
@@ -228,6 +228,29 @@ def _normalize_content(content: Any) -> Any:
     return str(content)
 
 
+# Built-in search tool types that new-api / OpenAI clients may inject.
+# cli-chat-proxy chat/completions only accepts tools[].type = function | live_search,
+# and live_search now requires `sources` AND is deprecated (410 Agent Tools API).
+# So for the OpenAI chat path we DROP these built-ins instead of forwarding them.
+_BUILTIN_SEARCH_TOOL_TYPES = frozenset(
+    {
+        "web_search",
+        "web_search_preview",
+        "live_search",
+        "x_search",
+        "builtin_function",
+        "builtin",
+    }
+)
+
+
+def _is_builtin_search_tool(tool: Any) -> bool:
+    if not isinstance(tool, dict):
+        return False
+    ttype = (tool.get("type") or "").strip().lower()
+    return ttype in _BUILTIN_SEARCH_TOOL_TYPES
+
+
 def _normalize_tools(tools: list[Any] | None) -> list[Any] | None:
     """
     Accept OpenAI Chat Completions tool shape and built-in tool types.
@@ -236,10 +259,17 @@ def _normalize_tools(tools: list[Any] | None) -> list[Any] | None:
       {"type":"function","function":{"name":...,"description":...,"parameters":...}}
     Flat function (some SDKs):
       {"type":"function","name":...,"description":...,"parameters":...}
-    Built-in web search aliases (mapped to xAI Build live_search):
-      {"type":"web_search_preview", ...}
-      {"type":"web_search", ...}
-      {"type":"live_search", ...}
+
+    Built-in web/live search tools from new-api playground / OpenAI Responses:
+      {"type":"web_search" | "web_search_preview" | "live_search" | "x_search", ...}
+
+    Upstream cli-chat-proxy chat/completions:
+      - tools[].type only allows `function` | `live_search`
+      - bare `live_search` → 422 missing field `sources`
+      - `live_search` + sources → 410 deprecated (Agent Tools API)
+
+    Therefore built-in search tools are **stripped** on this chat path so
+    new-api / relays do not surface Upstream 422. Client function tools pass.
     """
     if not tools:
         return tools
@@ -249,32 +279,12 @@ def _normalize_tools(tools: list[Any] | None) -> list[Any] | None:
             out.append(t)
             continue
         ttype = (t.get("type") or "function").lower()
-        # Built-in search tools: upstream chat accepts only function | live_search
-        # (web_search / web_search_preview are client-facing aliases).
-        if ttype in (
-            "web_search_preview",
-            "web_search",
-            "live_search",
-            "builtin_function",
-        ):
-            normalized: dict[str, Any] = {"type": "live_search"}
-            # Pass through optional xAI live_search fields when provided.
-            for key in (
-                "user_location",
-                "search_context_size",
-                "external_web_access",
-                "search_content_types",
-                "from_date",
-                "to_date",
-                "max_results",
-            ):
-                if t.get(key) is not None:
-                    normalized[key] = t[key]
-            out.append(normalized)
+        # Drop built-in search tools — do not map to broken/deprecated live_search.
+        if ttype in _BUILTIN_SEARCH_TOOL_TYPES:
             continue
         if ttype != "function":
-            # pass through other tool types as-is
-            out.append(t)
+            # Unknown non-function types are unsafe for this upstream; drop them
+            # rather than forwarding a shape that 422s the whole request.
             continue
         if isinstance(t.get("function"), dict):
             fn = t["function"]
@@ -287,7 +297,7 @@ def _normalize_tools(tools: list[Any] | None) -> list[Any] | None:
         # flatten → nest
         name = t.get("name")
         if not name:
-            out.append(t)
+            # no name and not a recognized function — drop
             continue
         fn: dict[str, Any] = {"name": name}
         if t.get("description") is not None:
@@ -295,15 +305,19 @@ def _normalize_tools(tools: list[Any] | None) -> list[Any] | None:
         params = t.get("parameters") if t.get("parameters") is not None else t.get("input_schema")
         if params is not None:
             fn["parameters"] = params
+        else:
+            fn["parameters"] = {"type": "object", "properties": {}}
         out.append({"type": "function", "function": fn})
-    return out
+    return out or None
 
 
 def _normalize_tool_choice(tool_choice: Any) -> Any:
     """
     Accept OpenAI Chat Completions tool_choice and map to upstream shape.
     Supports: "none" | "auto" | "required" | {"type":"function","function":{"name":"..."}}
-              | {"type":"web_search_preview"} | {"type":"web_search"} | {"type":"live_search"}
+
+    Built-in search tool_choice (web_search / live_search / …) is dropped —
+    upstream chat rejects or deprecates those variants.
     """
     if tool_choice is None:
         return None
@@ -312,10 +326,12 @@ def _normalize_tool_choice(tool_choice: Any) -> Any:
     if not isinstance(tool_choice, dict):
         return tool_choice
     tc_type = (tool_choice.get("type") or "function").lower()
-    if tc_type in ("web_search_preview", "web_search", "live_search"):
-        return {"type": "live_search"}
+    if tc_type in _BUILTIN_SEARCH_TOOL_TYPES:
+        # Fall back to auto rather than forcing a deprecated live_search choice.
+        return "auto"
     if tc_type != "function":
-        return tool_choice
+        # Unknown object choice — drop to auto to avoid upstream 422.
+        return "auto"
     fn = tool_choice.get("function")
     if isinstance(fn, dict) and fn.get("name"):
         return {"type": "function", "function": {"name": fn["name"]}}
@@ -357,20 +373,16 @@ def build_upstream_body(req: ChatCompletionRequest, model: str) -> dict[str, Any
 
     tools = _normalize_tools(req.tools)
     tool_choice = _normalize_tool_choice(req.tool_choice)
-    # If client asks for grok-search model, auto-inject live_search tool
+    # grok-search / web-search model aliases used to auto-inject live_search.
+    # Upstream now deprecates live_search on chat/completions (410 Agent Tools).
+    # Keep aliases as normal chat models; do not inject broken search tools.
     if req.model and req.model.strip().lower() in ("grok-search", "web-search"):
-        search_tool = {"type": "live_search"}
-        if not tools:
-            tools = [search_tool]
-        elif not any(
-            (t.get("type") or "").lower()
-            in ("web_search_preview", "web_search", "live_search")
-            for t in tools
-            if isinstance(t, dict)
+        # If the only client tools were built-in search (now stripped), tools may
+        # be None — that is intentional and avoids Upstream 422.
+        if tool_choice is not None and _is_builtin_search_tool(
+            tool_choice if isinstance(tool_choice, dict) else {"type": str(tool_choice)}
         ):
-            tools = tools + [search_tool]
-        if tool_choice is None:
-            tool_choice = {"type": "live_search"}
+            tool_choice = "auto"
 
     optional = {
         "temperature": req.temperature,
@@ -423,6 +435,9 @@ def _sanitize_upstream_body(body: dict[str, Any], *, model: str | None = None) -
     """Drop/clamp fields that cli-chat-proxy rejects for Grok models."""
     # Internal bookkeeping must never reach upstream.
     body.pop("_history_compact", None)
+    # Deprecated live-search knobs → 410 on current cli-chat-proxy builds.
+    body.pop("search_parameters", None)
+    body.pop("web_search_options", None)
     # Always drop known-unsupported OpenAI knobs for this upstream.
     for key in list(body.keys()):
         if key in _UPSTREAM_UNSUPPORTED_PARAMS:
@@ -458,6 +473,25 @@ def _sanitize_upstream_body(body: dict[str, Any], *, model: str | None = None) -
 
     # new-api playground may inject non-OpenAI fields (e.g. group) via extra="allow".
     body.pop("group", None)
+
+    # Final tools scrub: chat/completions only allows function tools now.
+    tools = body.get("tools")
+    if isinstance(tools, list):
+        cleaned = [
+            t
+            for t in tools
+            if isinstance(t, dict)
+            and (t.get("type") or "function").lower() == "function"
+        ]
+        if cleaned:
+            body["tools"] = cleaned
+        else:
+            body.pop("tools", None)
+    tc = body.get("tool_choice")
+    if isinstance(tc, dict):
+        tc_type = (tc.get("type") or "function").lower()
+        if tc_type != "function":
+            body["tool_choice"] = "auto"
 
 
 def _ensure_stream_include_usage(body: dict[str, Any]) -> None:
