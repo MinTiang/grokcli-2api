@@ -198,6 +198,11 @@ SSE_KEEPALIVE_INTERVAL = float(os.getenv("GROK2API_SSE_KEEPALIVE", "8"))
 # - content: merge reasoning into content without tags
 REASONING_COMPAT = os.getenv("GROK2API_REASONING_COMPAT", "off").strip().lower()
 
+# ── History compaction (Claude Code / long tool loops via sub2api) ──
+# Shrink past tool results before upstream so multi-round agent sessions
+# do not blow past body size / context and surface as client API errors.
+# Implemented in history_compact.py; env knobs live there too (imported below).
+
 # Map common aliases -> real model ids (OpenAI + Anthropic client defaults)
 MODEL_ALIASES: dict[str, str] = {
     "gpt-4": DEFAULT_MODEL,

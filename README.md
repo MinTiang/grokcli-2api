@@ -2,7 +2,7 @@
 
 把 **Grok OIDC 登录态** 转成 **OpenAI / Anthropic 兼容 API**，并附带 Web 管理台：多 API Key、多账号轮询、设备码 / 导入 / 协议注册。
 
-**当前版本：v1.8.22**
+**当前版本：v1.8.23**
 
 - **独立运行**：不依赖本地 Grok CLI，不调用 `grok login` / 浏览器 OAuth
 - **协议注册**：内置 `grok-build-auth`（HTTP 协议，无需 Chromium）
@@ -15,16 +15,24 @@
 
 ---
 
-## 本次更新（v1.8.22）
+## 本次更新（v1.8.23）
 
 | 方向 | 内容 |
 |------|------|
 | 可选 | **History compact**（**默认关闭**）：长 Claude Code / sub2api 多轮 tool 会话可压缩旧 `tool` / `tool_result` |
 | 开启后 | 保留最近 **6** 轮完整 tool 结果；单条 tool 结果上限 **12KB**；messages JSON 预算 **~280KB** |
-| 协议 | 继续沿用 1.8.21 串行 tool SSE / dense index（sub2api `Content block not found` 防护） |
-| 观测 | 响应头 `X-Grok2API-History-Compact` / `Before` / `After` / `Tool-Rounds`（仅 compact 生效时） |
+| 协议 | 出站 **每帧最多 1 个完整 tool** + dense index；Anthropic 路径 tool block 串行 start→args→stop |
+| 上游 | 内置搜索映射到 xAI `live_search`（兼容 `web_search` / `web_search_preview` 别名） |
+| 观测 | 响应头 `X-Grok2API-History-Compact` / `Before` / `After` / `Tool-Rounds` |
 | 配置 | `GROK2API_HISTORY_COMPACT=0`（默认）· 需要时再 `=1` + `KEEP_TOOL_ROUNDS` 等 |
 | 说明 | 默认**不**压缩工具上下文；开启后旧 tool 内容会被占位。**不能**消除 Grok free-usage 429 |
+
+### 历史（v1.8.22）
+
+| 方向 | 内容 |
+|------|------|
+| 可选 | 引入 History compact 开关与响应头观测（默认关闭） |
+| 协议 | 串行 tool SSE / dense index 加固（sub2api `Content block not found`） |
 
 ### 历史（v1.8.21）
 

@@ -543,6 +543,10 @@ def is_complete_tool_arguments_json(s: str) -> bool:
     later yields Claude Code / sub2api: "Content block not found".
 
     Require a complete JSON *object* or *array* for first emission / readiness.
+    Bare `{}` / `[]` are intentionally NOT ready during live streaming: Grok /
+    relays sometimes preview an empty object before the real arguments rewrite.
+    Emitting `{}` first freezes naive-append clients and can leave Claude Code
+    with empty tool input. Empty placeholders only flush on finish/close.
     """
     if not s or not str(s).strip():
         return False
@@ -553,7 +557,12 @@ def is_complete_tool_arguments_json(s: str) -> bool:
         parsed = json.loads(text)
     except (TypeError, ValueError, json.JSONDecodeError):
         return False
-    return isinstance(parsed, (dict, list))
+    if not isinstance(parsed, (dict, list)):
+        return False
+    # Hold empty containers until terminal flush — they are not real payloads.
+    if parsed == {} or parsed == []:
+        return False
+    return True
 
 
 def _parse_tool_arguments(raw: Any) -> dict[str, Any]:
@@ -1165,9 +1174,10 @@ class AnthropicStreamAssembler:
 
         if tool_calls:
             self._tools_pending = True
-            # Tools win: drop held preface so block 0 can be tool_use.
-            if self._held_pre_tool:
-                self._held_pre_tool.clear()
+            # Do NOT clear held preface yet — incomplete tool previews must not
+            # permanently discard a potential non-tool text answer. Preface is
+            # dropped only when a tool_use block actually starts outbound below,
+            # or when finish() confirms tools won.
             events.extend(self._close_thinking())
             events.extend(self._close_text())
             for raw in tool_calls:
@@ -1235,6 +1245,11 @@ class AnthropicStreamAssembler:
             # tool is not ready, hold higher tools. Sparse missing lower indices
             # are holes — we still assign dense content_block indices via
             # _next_index, so converters never see block 1 without block 0.
+            #
+            # Claude Code / sub2api often keep only one content_block "active".
+            # Opening tool_use 1 while tool_use 0 is still open yields intermittent
+            # "Content block not found" / "content block not found". Emit tools
+            # strictly one-at-a-time: start → args → stop, then the next tool.
             for oi in sorted(self._tools.keys()):
                 state = self._tools[oi]
                 if state.get("stopped"):
@@ -1261,6 +1276,10 @@ class AnthropicStreamAssembler:
                             continue  # sparse hole
                         if lower.get("stopped"):
                             continue
+                        # Any still-open lower tool must finish first (sequential).
+                        if lower.get("started") and not lower.get("stopped"):
+                            blocked = True
+                            break
                         if not lower.get("started"):
                             # Only block on known lower tools (name/id/args).
                             if (
@@ -1272,10 +1291,21 @@ class AnthropicStreamAssembler:
                                 break
                     if blocked:
                         break
+                    # Also block if ANY earlier-started tool is still open, even if
+                    # its OpenAI index is higher (shouldn't happen with dense order,
+                    # but keep the single-active-block invariant hard).
+                    if any(
+                        s.get("started") and not s.get("stopped")
+                        for s in self._tools.values()
+                    ):
+                        break
                     state["block_index"] = self._next_index
                     self._next_index += 1
                     state["started"] = True
                     self._saw_tool = True
+                    # Tools confirmed on the wire — drop held thinking/text preface.
+                    if self._held_pre_tool:
+                        self._held_pre_tool.clear()
                     events.append(
                         anthropic_stream_block_start_tool(
                             state["block_index"],
@@ -1286,8 +1316,22 @@ class AnthropicStreamAssembler:
                 # Hold incomplete fragments. Emit only complete JSON (or a pure
                 # suffix after a prior complete send). Incomplete live pieces +
                 # later full rewrites corrupt naive-append clients (Read.file_path).
-                if state["started"]:
+                if state["started"] and not state.get("stopped"):
                     events.extend(self._flush_tool_args(state))
+                    # Sequential close: once this tool has a complete live payload
+                    # on the wire, stop it before opening the next tool block.
+                    sent = state.get("args_sent_text") or ""
+                    args_now = state.get("args") or ""
+                    if (
+                        sent
+                        and args_now
+                        and sent == args_now
+                        and is_complete_tool_arguments_json(args_now)
+                    ):
+                        events.append(
+                            anthropic_stream_block_stop(state["block_index"])
+                        )
+                        state["stopped"] = True
 
         return events
 
@@ -1320,19 +1364,24 @@ class AnthropicStreamAssembler:
         events.extend(self._close_thinking())
         events.extend(self._close_text())
         # Open any buffered tools that never became "started" (name without
-        # complete args, or args without live emission), then close all.
-        # Assign block_index only at real start time, in sorted OpenAI index order,
-        # so content_block indices never go backwards mid-stream.
+        # complete args, or args without live emission), then close each tool
+        # before starting the next. Assign block_index only at real start time,
+        # in sorted OpenAI index order, so content_block indices never go
+        # backwards mid-stream and only one block is active at a time.
         for oi in sorted(self._tools.keys()):
             state = self._tools[oi]
             if state.get("stopped"):
                 continue
             if not state.get("started"):
+                # Close any still-open prior tool before opening this one.
+                events.extend(self._close_tools())
                 if state.get("block_index") is None:
                     state["block_index"] = self._next_index
                     self._next_index += 1
                 state["started"] = True
                 self._saw_tool = True
+                if self._held_pre_tool:
+                    self._held_pre_tool.clear()
                 events.append(
                     anthropic_stream_block_start_tool(
                         state["block_index"],
@@ -1340,6 +1389,8 @@ class AnthropicStreamAssembler:
                         name=(state.get("name") or "tool").strip() or "tool",
                     )
                 )
+            # Close this tool (flush empty {} if needed) before the next.
+            events.extend(self._close_tools())
         events.extend(self._close_tools())
         # Upstream often finishes with stop even when tools were emitted.
         effective_finish = finish_reason

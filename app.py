@@ -47,9 +47,10 @@ from config import (
     UPSTREAM_BASE,
 )
 import config as _config
+import history_compact
 from models import load_models_from_cache, resolve_model
 
-APP_VERSION = "1.8.19"
+APP_VERSION = "1.8.23"
 
 
 def _on_startup() -> None:
@@ -235,9 +236,10 @@ def _normalize_tools(tools: list[Any] | None) -> list[Any] | None:
       {"type":"function","function":{"name":...,"description":...,"parameters":...}}
     Flat function (some SDKs):
       {"type":"function","name":...,"description":...,"parameters":...}
-    Built-in web search (OpenAI Responses API / Grok):
+    Built-in web search aliases (mapped to xAI Build live_search):
       {"type":"web_search_preview", ...}
       {"type":"web_search", ...}
+      {"type":"live_search", ...}
     """
     if not tools:
         return tools
@@ -247,17 +249,27 @@ def _normalize_tools(tools: list[Any] | None) -> list[Any] | None:
             out.append(t)
             continue
         ttype = (t.get("type") or "function").lower()
-        # Built-in search tools: normalize to upstream web_search_preview
-        if ttype in ("web_search_preview", "web_search", "builtin_function"):
-            # Upstream requires parameters field on every tool entry
-            normalized: dict[str, Any] = {
-                "type": "web_search_preview",
-                "parameters": {"type": "object", "properties": {}},
-            }
-            if isinstance(t.get("user_location"), dict):
-                normalized["user_location"] = t["user_location"]
-            if isinstance(t.get("search_context_size"), str):
-                normalized["search_context_size"] = t["search_context_size"]
+        # Built-in search tools: upstream chat accepts only function | live_search
+        # (web_search / web_search_preview are client-facing aliases).
+        if ttype in (
+            "web_search_preview",
+            "web_search",
+            "live_search",
+            "builtin_function",
+        ):
+            normalized: dict[str, Any] = {"type": "live_search"}
+            # Pass through optional xAI live_search fields when provided.
+            for key in (
+                "user_location",
+                "search_context_size",
+                "external_web_access",
+                "search_content_types",
+                "from_date",
+                "to_date",
+                "max_results",
+            ):
+                if t.get(key) is not None:
+                    normalized[key] = t[key]
             out.append(normalized)
             continue
         if ttype != "function":
@@ -291,7 +303,7 @@ def _normalize_tool_choice(tool_choice: Any) -> Any:
     """
     Accept OpenAI Chat Completions tool_choice and map to upstream shape.
     Supports: "none" | "auto" | "required" | {"type":"function","function":{"name":"..."}}
-              | {"type":"web_search_preview"} | {"type":"web_search"}
+              | {"type":"web_search_preview"} | {"type":"web_search"} | {"type":"live_search"}
     """
     if tool_choice is None:
         return None
@@ -300,8 +312,8 @@ def _normalize_tool_choice(tool_choice: Any) -> Any:
     if not isinstance(tool_choice, dict):
         return tool_choice
     tc_type = (tool_choice.get("type") or "function").lower()
-    if tc_type in ("web_search_preview", "web_search"):
-        return {"type": "web_search_preview"}
+    if tc_type in ("web_search_preview", "web_search", "live_search"):
+        return {"type": "live_search"}
     if tc_type != "function":
         return tool_choice
     fn = tool_choice.get("function")
@@ -345,22 +357,20 @@ def build_upstream_body(req: ChatCompletionRequest, model: str) -> dict[str, Any
 
     tools = _normalize_tools(req.tools)
     tool_choice = _normalize_tool_choice(req.tool_choice)
-    # If client asks for grok-search model, auto-inject web_search tool
+    # If client asks for grok-search model, auto-inject live_search tool
     if req.model and req.model.strip().lower() in ("grok-search", "web-search"):
-        search_tool = {
-            "type": "web_search_preview",
-            "parameters": {"type": "object", "properties": {}},
-        }
+        search_tool = {"type": "live_search"}
         if not tools:
             tools = [search_tool]
         elif not any(
-            (t.get("type") or "").lower() in ("web_search_preview", "web_search")
+            (t.get("type") or "").lower()
+            in ("web_search_preview", "web_search", "live_search")
             for t in tools
             if isinstance(t, dict)
         ):
             tools = tools + [search_tool]
         if tool_choice is None:
-            tool_choice = {"type": "web_search_preview"}
+            tool_choice = {"type": "live_search"}
 
     optional = {
         "temperature": req.temperature,
@@ -389,6 +399,8 @@ def build_upstream_body(req: ChatCompletionRequest, model: str) -> dict[str, Any
     _sanitize_upstream_body(body, model=model)
     # Secondary relays (newapi/sub2api) rely on final stream usage for billing.
     _ensure_stream_include_usage(body)
+    # Long Claude Code tool loops → huge bodies; compact past tool results.
+    _apply_history_compact(body)
     return body
 
 
@@ -409,6 +421,8 @@ _UPSTREAM_UNSUPPORTED_PARAMS = frozenset(
 
 def _sanitize_upstream_body(body: dict[str, Any], *, model: str | None = None) -> None:
     """Drop/clamp fields that cli-chat-proxy rejects for Grok models."""
+    # Internal bookkeeping must never reach upstream.
+    body.pop("_history_compact", None)
     # Always drop known-unsupported OpenAI knobs for this upstream.
     for key in list(body.keys()):
         if key in _UPSTREAM_UNSUPPORTED_PARAMS:
@@ -457,6 +471,39 @@ def _ensure_stream_include_usage(body: dict[str, Any]) -> None:
         opts = dict(opts)
     opts["include_usage"] = True
     body["stream_options"] = opts
+
+
+def _body_for_upstream(body: dict[str, Any]) -> dict[str, Any]:
+    """Copy body without private grokcli-2api keys (never send to cli-chat-proxy)."""
+    if not isinstance(body, dict):
+        return body
+    out = dict(body)
+    out.pop("_history_compact", None)
+    return out
+
+
+def _apply_history_compact(body: dict[str, Any]) -> dict[str, Any]:
+    """Compact inbound messages on an OpenAI-style upstream body; stash stats."""
+    stats = history_compact.compact_upstream_body(body)
+    body["_history_compact"] = stats
+    return stats
+
+
+def _history_compact_headers(body: dict[str, Any]) -> dict[str, str]:
+    """Expose compaction stats on responses for debugging long tool sessions."""
+    stats = body.get("_history_compact") if isinstance(body, dict) else None
+    if not isinstance(stats, dict):
+        return {}
+    hdr: dict[str, str] = {
+        "X-Grok2API-History-Compact": "1" if stats.get("applied") else "0",
+    }
+    if stats.get("before_chars") is not None:
+        hdr["X-Grok2API-History-Before"] = str(stats.get("before_chars"))
+    if stats.get("after_chars") is not None:
+        hdr["X-Grok2API-History-After"] = str(stats.get("after_chars"))
+    if stats.get("tool_rounds") is not None:
+        hdr["X-Grok2API-History-Tool-Rounds"] = str(stats.get("tool_rounds"))
+    return hdr
 
 
 def _estimate_text_tokens(text: str) -> int:
@@ -807,6 +854,35 @@ def _merge_tool_arguments(current: str, incoming: str) -> str:
     return anth.merge_tool_argument_delta(current, incoming)
 
 
+
+def _iter_tool_sse_chunks(
+    *,
+    chat_id: str,
+    model: str,
+    created: int,
+    tool_calls: list[Any],
+) -> list[str]:
+    """One tool_calls[] entry per SSE frame.
+
+    sub2api's CC→Responses→Anthropic path opens a content_block per tool in the
+    same ChatCompletions chunk before closing the previous one. Emitting multiple
+    tools in a single delta.tool_calls array therefore produces concurrent open
+    blocks and Claude Code: "Content block not found" when later deltas/stops
+    target the non-active index. Split so each tool is its own SSE event.
+    """
+    if not tool_calls:
+        return []
+    return [
+        _sse_chunk(
+            chat_id=chat_id,
+            model=model,
+            created=created,
+            tool_calls=[tc],
+        )
+        for tc in tool_calls
+        if isinstance(tc, dict)
+    ]
+
 def _tool_slot_known(entry: dict[str, Any] | None) -> bool:
     """True when an accumulated tool slot has any identity/payload worth ordering."""
     if not entry:
@@ -843,23 +919,12 @@ def _assign_dense_tool_out_index(
     return out_i
 
 
-def _tool_call_argument_delta(
+def _ingest_tool_call_deltas(
     acc: dict[int, dict[str, Any]], deltas: list[Any]
-) -> list[dict[str, Any]]:
-    """
-    Merge tool_call deltas into acc and return sanitized OpenAI-style deltas.
-
-    Downstream clients (Claude Code via sub2api/new-api) naive-append
-    `function.arguments`. Incomplete fragments + later full rewrites are common
-    under double-proxy and corrupt Read.file_path if emitted live.
-
-    Additionally, name/id-only previews (arguments="") make Anthropic converters
-    open a tool content_block early; later arg-only chunks then hit
-    "Content block not found" / type-mismatch. Emit only when we can ship a
-    complete JSON arguments value together with name (atomic first frame).
-    """
+) -> None:
+    """Merge upstream tool_call deltas into acc (no outbound emission)."""
     if not deltas:
-        return []
+        return
     for raw in deltas:
         if not isinstance(raw, dict):
             continue
@@ -907,127 +972,126 @@ def _tool_call_argument_delta(
                     _coerce_tool_arguments(raw.get("input")),
                 )
 
-    out: list[dict[str, Any]] = []
-    # Emit in ascending *upstream* tool index order, and never start a higher
-    # *known* tool while a lower known tool is still buffered. Missing lower
-    # indices are treated as sparse holes (renumbered on the wire).
+
+def _build_outbound_tool_item(
+    acc: dict[int, dict[str, Any]], entry: dict[str, Any], *, remaining: str
+) -> dict[str, Any]:
+    """Build one complete OpenAI tool_calls[] item and mark it emitted."""
+    out_index = _assign_dense_tool_out_index(acc, entry)
+    name = (entry.get("function", {}).get("name") or "").strip()
+    item: dict[str, Any] = {
+        "index": out_index,
+        "type": entry.get("type") or "function",
+        "function": {"arguments": remaining},
+    }
+    if entry.get("id") and not entry.get("_id_emitted"):
+        item["id"] = entry["id"]
+        entry["_id_emitted"] = True
+    if name and not entry.get("_name_emitted"):
+        item["function"]["name"] = name
+        entry["_name_emitted"] = True
+    entry["_sent_text"] = remaining
+    entry["_args_sent"] = len(remaining)
+    entry["_emitted"] = True
+    return item
+
+
+def _tool_call_argument_delta(
+    acc: dict[int, dict[str, Any]], deltas: list[Any]
+) -> list[dict[str, Any]]:
+    """
+    Merge tool_call deltas into acc and return sanitized OpenAI-style deltas.
+
+    Critical for Claude Code via sub2api (platform=openai, upstream chat/completions):
+
+    sub2api converts CC → Responses → Anthropic and keeps only one active
+    content_block. It also special-cases tool name "Read" by *buffering* args
+    and only flushing them on function_call_arguments.done. If we open tool 1
+    while tool 0 (Read) is still open, later deltas/stops hit the wrong block
+    and Claude Code raises:
+        API Error: Content block not found
+
+    Therefore outbound policy is strict:
+      1. Hold every tool until name + complete non-empty JSON args are ready
+      2. Emit **at most one** complete tool frame per call (atomic id+name+args)
+      3. Never open a higher tool while a lower known tool is unfinished
+      4. Never stream argument suffixes live — full JSON once, then done
+
+    Intermediate JSON scalars like `"file_path"` and bare `{}` / `[]` stay held.
+    """
+    _ingest_tool_call_deltas(acc, deltas)
+
+    # Emit at most ONE ready tool per invocation so sub2api can fully
+    # start→args→stop that content_block before the next tool opens.
     for idx in sorted(acc.keys()):
         entry = acc[idx]
+        if entry.get("_emitted"):
+            continue
         args = entry.get("function", {}).get("arguments") or ""
-        sent_text = entry.get("_sent_text") or ""
         name = (entry.get("function", {}).get("name") or "").strip()
 
-        if not entry.get("_emitted"):
-            blocked = False
-            for lower in range(0, idx):
-                low = acc.get(lower)
-                if low is None:
-                    continue  # sparse hole — dense renumber handles it
-                if low.get("_emitted"):
-                    continue
-                if _tool_slot_known(low):
-                    blocked = True
-                    break
-            if blocked:
+        # Never overtake a lower known unfinished tool (including sparse holes).
+        blocked = False
+        for lower in range(0, idx):
+            low = acc.get(lower)
+            if low is None:
+                continue
+            if low.get("_emitted"):
+                continue
+            if _tool_slot_known(low):
+                blocked = True
                 break
-
-        # Hold until arguments are one complete tool JSON object/array.
-        # Intermediate JSON scalars like `"file_path"` must NOT open a block.
-        remaining = ""
-        if args and anth.is_complete_tool_arguments_json(args):
-            if not sent_text:
-                remaining = args
-            elif args.startswith(sent_text) and args != sent_text:
-                remaining = args[len(sent_text) :]
-        if not remaining:
-            # If this lower tool is known (has name/id) but not ready, stop here so
-            # higher indices cannot overtake it.
-            if not entry.get("_emitted") and (name or entry.get("id")):
-                break
-            continue
-        # First emission also needs a name so converters can open tool_use once.
-        if not entry.get("_emitted") and not name:
+        if blocked:
             break
 
-        out_index = _assign_dense_tool_out_index(acc, entry)
-        item: dict[str, Any] = {
-            "index": out_index,
-            "type": entry.get("type") or "function",
-            "function": {},
-        }
-        if entry.get("id") and not entry.get("_id_emitted"):
-            item["id"] = entry["id"]
-            entry["_id_emitted"] = True
-        if name and not entry.get("_name_emitted"):
-            item["function"]["name"] = name
-            entry["_name_emitted"] = True
-        item["function"]["arguments"] = remaining
-        entry["_sent_text"] = sent_text + remaining
-        entry["_args_sent"] = len(entry["_sent_text"])
-        entry["_emitted"] = True
-        out.append(item)
-    return out
+        if not name:
+            # Known id without name — keep holding this slot.
+            if entry.get("id") or str(args).strip():
+                break
+            continue
+        if not args or not anth.is_complete_tool_arguments_json(args):
+            # Name/id known but args incomplete — hold (do not open block early).
+            break
+
+        return [_build_outbound_tool_item(acc, entry, remaining=str(args))]
+    return []
 
 
 def _flush_tool_call_argument_deltas(
     acc: dict[int, dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Emit deferred tool calls before the terminal finish chunk.
+    """Emit any still-held tools before the terminal finish chunk.
 
-    Prefer one complete JSON blob per tool, bundled with id/name on first
-    emission so Anthropic converters (sub2api) open a single content_block.
-    Truncated upstream args still flush once as a single payload.
-    Outbound indices are dense 0..n-1 in emission order.
+    One complete JSON blob per tool, dense indices 0..n-1, in upstream order.
+    Truncated upstream args still flush once so clients get a single payload.
     """
     out: list[dict[str, Any]] = []
     for idx in sorted(acc.keys()):
         entry = acc[idx]
+        if entry.get("_emitted"):
+            continue
         fn = entry.get("function") or {}
         name = (fn.get("name") or "").strip()
         args = fn.get("arguments") or ""
         if not isinstance(args, str):
             args = _coerce_tool_arguments(args)
-        sent_text = entry.get("_sent_text") or ""
 
-        if sent_text:
-            if not str(args).startswith(sent_text):
-                # Already sent a non-prefix snapshot; rewriting would corrupt
-                # naive-append clients.
-                continue
-            remaining = str(args)[len(sent_text) :]
-        else:
-            remaining = str(args) if args else ""
-
-        first_emit = not entry.get("_emitted")
-        if not remaining and not first_emit:
+        # Drop fully empty ghost slots.
+        if not name and not entry.get("id") and not str(args).strip():
             continue
-        # Drop fully empty ghost slots (no name, no args, never emitted).
-        if not remaining and not name and not entry.get("id"):
-            continue
-        if first_emit and not name:
+        if not name:
             # Cannot open a useful tool_use without a name.
             continue
-        if not remaining:
-            remaining = "{}"
-
-        out_index = _assign_dense_tool_out_index(acc, entry)
-        item: dict[str, Any] = {
-            "index": out_index,
-            "type": entry.get("type") or "function",
-            "function": {},
-        }
-        if entry.get("id") and not entry.get("_id_emitted"):
-            item["id"] = entry["id"]
-            entry["_id_emitted"] = True
-        if name and not entry.get("_name_emitted"):
-            item["function"]["name"] = name
-            entry["_name_emitted"] = True
-        item["function"]["arguments"] = remaining
-        entry["_sent_text"] = (sent_text or "") + remaining
-        entry["_args_sent"] = len(entry["_sent_text"])
-        entry["_emitted"] = True
-        out.append(item)
-    return out
+        remaining = str(args) if str(args).strip() else "{}"
+        # Prefer complete JSON; if truncated, still ship once as best-effort.
+        if not anth.is_complete_tool_arguments_json(remaining):
+            # Keep raw truncated text rather than inventing fields — better a
+            # single invalid JSON than doubled fragments.
+            remaining = str(args) if str(args).strip() else "{}"
+        out.append(_build_outbound_tool_item(acc, entry, remaining=remaining))
+    # Optional safety valve for pathological multi-tool dumps (default off).
+    capped = history_compact.cap_outbound_tools(out)
+    return capped if capped is not None else out
 
 
 def _merge_tool_name(current: str, incoming: str) -> str:
@@ -1354,6 +1418,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     chat_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
     created = int(time.time())
 
+    compact_hdr = _history_compact_headers(body)
     if req.stream:
         return StreamingResponse(
             _stream_proxy_with_failover(
@@ -1373,6 +1438,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 "X-Accel-Buffering": "no",
                 "X-Grok2API-Accounts": str(len(chain)),
                 "X-Grok2API-Affinity": "1" if prefer_account else "0",
+                **compact_hdr,
                 **(
                     {"X-Grok2API-Conversation-Fp": conv_fp}
                     if conv_fp
@@ -1435,6 +1501,9 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             # non-standard but useful for multi-account debugging
             result["x_grok2api_account"] = creds.email or creds.auth_key
             result["x_grok2api_affinity"] = bool(prefer_account)
+            hc_stats = body.get("_history_compact") if isinstance(body, dict) else None
+            if isinstance(hc_stats, dict):
+                result["x_grok2api_history_compact"] = hc_stats
             if conv_fp:
                 result["x_grok2api_conversation_fp"] = conv_fp
             return result
@@ -1507,12 +1576,13 @@ async def _stream_proxy_with_failover(
         # turn ends without any outbound tool frames.
         held_pre_tool: list[tuple[str | None, str | None]] = []
         try:
+            upstream_body = _body_for_upstream(body)
             async with httpx.AsyncClient(
                 timeout=httpx.Timeout(TIMEOUT, connect=30.0),
                 limits=httpx.Limits(max_keepalive_connections=20, max_connections=100),
             ) as client:
                 async with client.stream(
-                    "POST", url, headers=headers, json=body
+                    "POST", url, headers=headers, json=upstream_body
                 ) as resp:
                     if resp.status_code >= 400:
                         err_text = (await resp.aread()).decode(
@@ -1611,9 +1681,20 @@ async def _stream_proxy_with_failover(
                                 tools_pending = True
                                 # Sanitize cumulative re-sends so naive-append
                                 # clients (Claude Code Read) still get valid JSON.
-                                emit_tool_calls = _tool_call_argument_delta(
-                                    tool_acc, tool_calls
-                                ) or None
+                                # Drain ALL ready tools one-by-one: first call
+                                # ingests upstream deltas, subsequent calls with
+                                # [] emit the next complete tool (never pack
+                                # multiple tools into one OpenAI delta).
+                                ready: list[Any] = []
+                                first = _tool_call_argument_delta(tool_acc, tool_calls)
+                                if first:
+                                    ready.extend(first)
+                                while True:
+                                    more = _tool_call_argument_delta(tool_acc, [])
+                                    if not more:
+                                        break
+                                    ready.extend(more)
+                                emit_tool_calls = ready or None
                                 # Only when a tool frame is actually outbound do
                                 # tools "win" the turn. Incomplete name-only /
                                 # partial-arg previews must keep holding preface.
@@ -1696,12 +1777,13 @@ async def _stream_proxy_with_failover(
                                     )
                                 if emit_tool_calls:
                                     saw_tool_calls = True
-                                    yield _sse_chunk(
+                                    for _tc_frame in _iter_tool_sse_chunks(
                                         chat_id=chat_id,
                                         model=model,
                                         created=created,
                                         tool_calls=emit_tool_calls,
-                                    )
+                                    ):
+                                        yield _tc_frame
                             elif finish:
                                 # finish-only upstream frame: content already held
                                 continue
@@ -1761,9 +1843,16 @@ async def _stream_proxy_with_failover(
                             if emit_tc:
                                 tools_pending = True
                                 if isinstance(emit_tc, list):
-                                    sanitized_tc = _tool_call_argument_delta(
-                                        tool_acc, emit_tc
-                                    ) or None
+                                    ready: list[Any] = []
+                                    first = _tool_call_argument_delta(tool_acc, emit_tc)
+                                    if first:
+                                        ready.extend(first)
+                                    while True:
+                                        more = _tool_call_argument_delta(tool_acc, [])
+                                        if not more:
+                                            break
+                                        ready.extend(more)
+                                    sanitized_tc = ready or None
                                 if sanitized_tc:
                                     saw_tool_calls = True
                             # Flush any remaining held tools from the non-SSE body.
@@ -1800,12 +1889,13 @@ async def _stream_proxy_with_failover(
                             # Tools first, then content only if this is a non-tool turn.
                             if sanitized_tc and not client_gone:
                                 saw_tool_calls = True
-                                yield _sse_chunk(
+                                for _tc_frame in _iter_tool_sse_chunks(
                                     chat_id=chat_id,
                                     model=model,
                                     created=created,
                                     tool_calls=sanitized_tc,
-                                )
+                                ):
+                                    yield _tc_frame
                             if emit_content and not (
                                 tools_requested and saw_tool_calls
                             ):
@@ -1839,12 +1929,13 @@ async def _stream_proxy_with_failover(
                     # Tools confirmed on flush path — drop held preface.
                     held_pre_tool.clear()
                     reasoning_compat.think_open = False
-                    yield _sse_chunk(
+                    for _tc_frame in _iter_tool_sse_chunks(
                         chat_id=chat_id,
                         model=model,
                         created=created,
                         tool_calls=flush_tc,
-                    )
+                    ):
+                        yield _tc_frame
             final_tc = _finalize_tool_calls(tool_acc)
             # Only treat as tool-finish when something was (or will be) emitted.
             if final_tc and any(
@@ -1982,7 +2073,7 @@ async def _collect_completion(
     complete_tool_calls: list[dict[str, Any]] | None = None
 
     # Ensure stream usage is requested when we force-stream for non-stream clients
-    req_body = dict(body)
+    req_body = _body_for_upstream(body)
     _ensure_stream_include_usage(req_body)
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(TIMEOUT, connect=30.0)) as client:
@@ -2159,8 +2250,12 @@ async def anthropic_messages(
     if FORCE_UPSTREAM_STREAM:
         body["stream"] = True
     _ensure_stream_include_usage(body)
+    # Same long-tool-loop compaction as OpenAI path (sub2api often hits OpenAI
+    # chat/completions, but direct Anthropic /v1/messages also benefits).
+    _apply_history_compact(body)
     url = f"{UPSTREAM_BASE}/chat/completions"
 
+    compact_hdr = _history_compact_headers(body)
     if req.stream:
         return StreamingResponse(
             _stream_anthropic_with_failover(
@@ -2180,6 +2275,7 @@ async def anthropic_messages(
                 "X-Grok2API-Protocol": "anthropic",
                 "X-Grok2API-Accounts": str(len(chain)),
                 "X-Grok2API-Affinity": "1" if prefer_account else "0",
+                **compact_hdr,
                 **(
                     {"X-Grok2API-Conversation-Fp": conv_fp}
                     if conv_fp
@@ -2285,6 +2381,7 @@ async def _stream_anthropic_with_failover(
             pass
 
     tools_requested = bool(body.get("tools") or body.get("functions"))
+    upstream_body = _body_for_upstream(body)
     for idx, creds in enumerate(chain):
         headers = upstream_headers(creds.token, model)
         assembler = anth.AnthropicStreamAssembler(
@@ -2301,7 +2398,7 @@ async def _stream_anthropic_with_failover(
                 timeout=httpx.Timeout(TIMEOUT, connect=30.0)
             ) as client:
                 async with client.stream(
-                    "POST", url, headers=headers, json=body
+                    "POST", url, headers=headers, json=upstream_body
                 ) as resp:
                     if resp.status_code >= 400:
                         err_text = (await resp.aread()).decode(
