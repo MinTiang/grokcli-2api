@@ -675,13 +675,204 @@ def export_auth_payload(
 
 
 
-def collect_normalized_entries(raw: str | dict[str, Any]) -> dict[str, Any]:
+# ── CLIProxyAPI (CPA) auth files ────────────────────────────────────────────
+# Official CPA per-account file (written by xai_oauth / save_cliproxyapi_auth_record):
+#   {
+#     "type": "xai",                 # also: grok / x-ai / x.ai
+#     "auth_kind": "oauth",
+#     "email": "...",
+#     "sub": "...",
+#     "access_token": "eyJ...",
+#     "refresh_token": "...",
+#     "id_token": "...",
+#     "expired": "2026-06-11T06:45:02.000+08:00",   # ISO, not unix
+#     "last_refresh": "...",
+#     "base_url": "https://cli-chat-proxy.grok.com/v1",
+#     "disabled": false,
+#     "headers": { "X-XAI-Token-Auth": "xai-grok-cli", ... }
+#   }
+# Also accept:
+#   - type=codex with access_token (same token fields; source marked)
+#   - bundle { "type": "cliproxyapi-auth-bundle", "accounts": [ ... ] }
+#   - bare list [ {...}, {...} ]
+#   - map { "email.json": {...}, ... } when values look like CPA records
+
+_CLIPROXY_XAI_TYPES = frozenset(
+    {"xai", "grok", "x-ai", "x.ai", "x_ai", "xai-oauth", "grok-oauth"}
+)
+_CLIPROXY_TOKEN_TYPES = _CLIPROXY_XAI_TYPES | frozenset(
+    {"codex", "openai", "chatgpt"}
+)
+
+
+def is_cliproxyapi_auth_record(obj: Any) -> bool:
+    """True when *obj* looks like a CLIProxyAPI single-account auth JSON."""
+    if not isinstance(obj, dict):
+        return False
+    access = (
+        obj.get("access_token")
+        or obj.get("accessToken")
+        or obj.get("key")
+        or obj.get("token")
+    )
+    if not isinstance(access, str) or not access.strip():
+        return False
+    t = str(obj.get("type") or obj.get("provider") or obj.get("platform") or "").strip().lower()
+    if t in _CLIPROXY_TOKEN_TYPES:
+        return True
+    # Untyped but CPA-shaped (has expired ISO + refresh_token + email)
+    if obj.get("refresh_token") and (
+        obj.get("expired") is not None
+        or obj.get("last_refresh") is not None
+        or obj.get("base_url")
+        or obj.get("headers")
+        or obj.get("auth_kind")
+    ):
+        return True
+    # base_url points at grok cli proxy
+    base = str(obj.get("base_url") or obj.get("baseUrl") or "").lower()
+    if "cli-chat-proxy.grok.com" in base or "api.x.ai" in base:
+        return True
+    return False
+
+
+def cliproxyapi_record_to_entry(obj: dict[str, Any]) -> dict[str, Any]:
+    """Convert one CLIProxyAPI auth record into our durable account entry shape."""
+    access = (
+        obj.get("access_token")
+        or obj.get("accessToken")
+        or obj.get("key")
+        or obj.get("token")
+        or ""
+    )
+    access = str(access).strip()
+    if not access:
+        raise ValueError("CLIProxyAPI record missing access_token")
+
+    entry: dict[str, Any] = {
+        "key": access,
+        "auth_mode": "cliproxyapi_import",
+        "source": "cliproxyapi",
+        "create_time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    refresh = obj.get("refresh_token") or obj.get("refreshToken")
+    if isinstance(refresh, str) and refresh.strip():
+        entry["refresh_token"] = refresh.strip()
+    id_token = obj.get("id_token") or obj.get("idToken")
+    if isinstance(id_token, str) and id_token.strip():
+        entry["id_token"] = id_token.strip()
+
+    email = obj.get("email") or obj.get("Email")
+    if isinstance(email, str) and email.strip():
+        entry["email"] = email.strip()
+
+    # CPA uses account_id / sub as principal id
+    uid = (
+        obj.get("user_id")
+        or obj.get("sub")
+        or obj.get("account_id")
+        or obj.get("principal_id")
+    )
+    if uid is not None and str(uid).strip():
+        entry["user_id"] = str(uid).strip()
+        entry["principal_id"] = str(uid).strip()
+
+    # CPA field is ``expired`` (ISO). Also accept expires_at / expires_in.
+    if obj.get("expires_at") is not None:
+        entry["expires_at"] = obj.get("expires_at")
+    elif obj.get("expired") is not None:
+        entry["expires_at"] = obj.get("expired")
+    elif obj.get("expires_in") is not None:
+        try:
+            entry["expires_at"] = float(time.time()) + float(obj["expires_in"])
+        except (TypeError, ValueError):
+            pass
+
+    t = str(obj.get("type") or obj.get("provider") or "").strip().lower()
+    if t:
+        entry["cliproxyapi_type"] = t
+    if obj.get("base_url"):
+        entry["cliproxyapi_base_url"] = str(obj.get("base_url"))
+    if isinstance(obj.get("headers"), dict):
+        entry["cliproxyapi_headers"] = dict(obj["headers"])
+    if obj.get("auth_kind"):
+        entry["cliproxyapi_auth_kind"] = str(obj.get("auth_kind"))
+    if obj.get("disabled") is True:
+        entry["cliproxyapi_disabled"] = True
+        entry["disabled_reason"] = "imported from CLIProxyAPI with disabled=true"
+
+    # SSO cookies if CPA stored them under cookies / session_cookies
+    for field in (
+        "sso",
+        "sso_cookie",
+        "sso_token",
+        "session_cookies",
+        "cookies",
+        "cookie",
+    ):
+        if obj.get(field) is not None and obj.get(field) != "":
+            entry[field] = obj[field]
+    sso_val = get_sso_value(entry)
+    if sso_val:
+        entry["sso"] = sso_val
+        entry.setdefault("sso_cookie", sso_val)
+    return entry
+
+
+def coerce_cliproxyapi_payload(parsed: Any) -> list[dict[str, Any]] | None:
+    """If *parsed* is CPA-shaped, return a list of raw CPA records; else None.
+
+    Returning None means "not CPA — fall through to generic import".
+    """
+    if isinstance(parsed, list):
+        recs = [x for x in parsed if is_cliproxyapi_auth_record(x)]
+        return recs if recs else None
+
+    if not isinstance(parsed, dict):
+        return None
+
+    # Bundle wrappers
+    t = str(parsed.get("type") or "").strip().lower()
+    if t in (
+        "cliproxyapi-auth-bundle",
+        "cliproxyapi-data",
+        "cliproxyapi-auth",
+        "cpa-auth-bundle",
+        "cpa-data",
+    ):
+        accs = parsed.get("accounts") or parsed.get("auths") or parsed.get("items")
+        if isinstance(accs, list):
+            recs = [x for x in accs if is_cliproxyapi_auth_record(x)]
+            return recs if recs else []
+        if isinstance(accs, dict):
+            recs = [v for v in accs.values() if is_cliproxyapi_auth_record(v)]
+            return recs if recs else []
+
+    # Single CPA record
+    if is_cliproxyapi_auth_record(parsed):
+        return [parsed]
+
+    # Map of filename/id → record (CPA auth dir dump without auth.x.ai keys)
+    if parsed and all(isinstance(v, dict) for v in parsed.values()):
+        # Don't steal our own auth.json map (keys contain auth.x.ai::)
+        keys = [str(k) for k in parsed.keys()]
+        if any(("auth.x.ai" in k) or ("accounts.x.ai" in k) or ("::" in k) for k in keys):
+            return None
+        recs = [v for v in parsed.values() if is_cliproxyapi_auth_record(v)]
+        # Only treat as CPA map when majority of values are CPA records
+        if recs and len(recs) >= max(1, int(0.5 * len(parsed))):
+            return recs
+
+    return None
+
+
+def collect_normalized_entries(raw: str | dict[str, Any] | list[Any]) -> dict[str, Any]:
     """Parse import payload into normalized account map without writing storage."""
     if isinstance(raw, str):
         text = raw.strip()
         if not text:
             return {"ok": False, "error": "empty payload"}
-        if text.startswith("{"):
+        if text.startswith("{") or text.startswith("["):
             try:
                 parsed: Any = json.loads(text)
             except json.JSONDecodeError as e:
@@ -691,8 +882,43 @@ def collect_normalized_entries(raw: str | dict[str, Any]) -> dict[str, Any]:
     else:
         parsed = raw
 
+    # CLIProxyAPI formats (single / list / bundle / auth-dir map)
+    cpa_recs = coerce_cliproxyapi_payload(parsed)
+    if cpa_recs is not None:
+        if not cpa_recs:
+            return {"ok": False, "error": "CLIProxyAPI 文件中没有可用的 access_token"}
+        raw_entries: list[tuple[str | None, dict[str, Any]]] = []
+        for rec in cpa_recs:
+            try:
+                ent = cliproxyapi_record_to_entry(rec)
+            except ValueError:
+                continue
+            pref = (
+                str(rec.get("email") or "").strip()
+                or str(rec.get("account_id") or rec.get("sub") or "").strip()
+                or None
+            )
+            raw_entries.append((pref, ent))
+        if not raw_entries:
+            return {"ok": False, "error": "CLIProxyAPI 记录无法解析为账号"}
+        normalized: dict[str, dict[str, Any]] = {}
+        for pref_id, ent in raw_entries:
+            try:
+                aid, nent = _normalize_entry(ent, preferred_id=pref_id)
+            except ValueError:
+                continue
+            normalized[aid] = nent
+        if not normalized:
+            return {"ok": False, "error": "CLIProxyAPI 记录缺少 token"}
+        return {
+            "ok": True,
+            "normalized": normalized,
+            "format": "cliproxyapi",
+            "count": len(normalized),
+        }
+
     if not isinstance(parsed, dict):
-        return {"ok": False, "error": "payload must be object or JWT string"}
+        return {"ok": False, "error": "payload must be object, list, or JWT string"}
 
     # Unwrap export format
     if (
@@ -708,7 +934,7 @@ def collect_normalized_entries(raw: str | dict[str, Any]) -> dict[str, Any]:
         if all(isinstance(v, dict) for v in auth_map.values()):
             parsed = auth_map
 
-    raw_entries: list[tuple[str | None, dict[str, Any]]] = []
+    raw_entries = []
     looks_like_map = False
     if parsed and all(isinstance(v, dict) for v in parsed.values()):
         sample_vals = list(parsed.values())
@@ -747,7 +973,7 @@ def collect_normalized_entries(raw: str | dict[str, Any]) -> dict[str, Any]:
         if not token or not isinstance(token, str):
             return {
                 "ok": False,
-                "error": "missing token/key. Provide JWT or auth.json entry.",
+                "error": "missing token/key. Provide JWT、auth.json 或 CLIProxyAPI auth JSON。",
             }
         account_id = (
             parsed.get("account_id") or parsed.get("id") or parsed.get("auth_key")
@@ -758,8 +984,11 @@ def collect_normalized_entries(raw: str | dict[str, Any]) -> dict[str, Any]:
             "create_time": parsed.get("create_time")
             or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         }
+        # Accept CPA-style ``expired`` on generic single objects too
         if parsed.get("expires_at") is not None:
             entry["expires_at"] = parsed["expires_at"]
+        elif parsed.get("expired") is not None:
+            entry["expires_at"] = parsed["expired"]
         if parsed.get("refresh_token"):
             entry["refresh_token"] = parsed["refresh_token"]
         for field in (
@@ -787,9 +1016,13 @@ def collect_normalized_entries(raw: str | dict[str, Any]) -> dict[str, Any]:
             "registration_session_id",
             "registration_batch_id",
             "sso_backup_path",
+            "id_token",
+            "sub",
         ):
             if parsed.get(field) is not None and parsed.get(field) != "":
                 entry[field] = parsed[field]
+        if not entry.get("user_id") and entry.get("sub"):
+            entry["user_id"] = str(entry.get("sub"))
         if not entry.get("sso"):
             _sso_val = get_sso_value(entry)
             if _sso_val:
@@ -802,7 +1035,7 @@ def collect_normalized_entries(raw: str | dict[str, Any]) -> dict[str, Any]:
     if not raw_entries:
         return {"ok": False, "error": "no valid account entries found"}
 
-    normalized: dict[str, dict[str, Any]] = {}
+    normalized = {}
     for pref_id, ent in raw_entries:
         try:
             aid, nent = _normalize_entry(ent, preferred_id=pref_id)
@@ -812,6 +1045,134 @@ def collect_normalized_entries(raw: str | dict[str, Any]) -> dict[str, Any]:
     if not normalized:
         return {"ok": False, "error": "entries missing token"}
     return {"ok": True, "normalized": normalized}
+
+
+def build_cliproxyapi_export_record(entry: dict[str, Any], *, aid: str = "") -> dict[str, Any] | None:
+    """Build one CLIProxyAPI-compatible auth JSON from a local account entry."""
+    if not isinstance(entry, dict):
+        return None
+    access = (
+        entry.get("key")
+        or entry.get("access_token")
+        or entry.get("token")
+        or ""
+    )
+    if not isinstance(access, str) or not access.strip():
+        return None
+    access = access.strip()
+    refresh = entry.get("refresh_token") or ""
+    if isinstance(refresh, str):
+        refresh = refresh.strip()
+    else:
+        refresh = ""
+
+    email = str(entry.get("email") or "").strip()
+    claims = decode_jwt_claims(access) if access else {}
+    if not email and claims.get("email"):
+        email = str(claims.get("email"))
+    sub = (
+        str(entry.get("user_id") or entry.get("principal_id") or entry.get("sub") or "")
+        .strip()
+        or str(claims.get("principal_id") or claims.get("sub") or "")
+    )
+
+    exp = parse_expires_at(entry.get("expires_at"), access)
+    expired_iso = ""
+    if exp is not None:
+        try:
+            from datetime import datetime, timezone
+
+            expired_iso = datetime.fromtimestamp(float(exp), tz=timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"
+            )
+        except Exception:
+            expired_iso = ""
+
+    headers = entry.get("cliproxyapi_headers")
+    if not isinstance(headers, dict) or not headers:
+        headers = {
+            "X-XAI-Token-Auth": "xai-grok-cli",
+            "x-grok-client-version": "0.2.93",
+            "x-grok-client-identifier": "grok-shell",
+        }
+    base_url = (
+        str(entry.get("cliproxyapi_base_url") or "").strip()
+        or "https://cli-chat-proxy.grok.com/v1"
+    )
+    rec: dict[str, Any] = {
+        "type": str(entry.get("cliproxyapi_type") or "xai"),
+        "auth_kind": str(entry.get("cliproxyapi_auth_kind") or "oauth"),
+        "email": email,
+        "sub": sub,
+        "access_token": access,
+        "refresh_token": refresh,
+        "id_token": str(entry.get("id_token") or ""),
+        "token_type": "Bearer",
+        "expired": expired_iso,
+        "last_refresh": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "base_url": base_url,
+        "disabled": bool(entry.get("cliproxyapi_disabled") or False),
+        "headers": dict(headers),
+    }
+    if aid:
+        rec["local_account_id"] = aid
+    if entry.get("account_id"):
+        rec["account_id"] = entry.get("account_id")
+    elif sub:
+        rec["account_id"] = sub
+    return rec
+
+
+def export_cliproxyapi_payload(
+    *,
+    account_ids: list[str] | None = None,
+    push_all: bool = False,
+) -> dict[str, Any]:
+    """Export local accounts as CLIProxyAPI auth-bundle JSON.
+
+    Shape (mirrors sub2api-data style so UI can download one file):
+
+      {
+        "type": "cliproxyapi-auth-bundle",
+        "version": 1,
+        "exported_at": "...",
+        "accounts": [ { type:xai, access_token, ... }, ... ]
+      }
+
+    Each accounts[] item is a single CPA auth file body (drop into CPA auth dir
+    as ``xai-<email>.json`` or import via this project's importer).
+    """
+    data = read_auth_map() or {}
+    if push_all or account_ids is None:
+        items = [(k, v) for k, v in data.items() if isinstance(v, dict)]
+    else:
+        wanted = {str(x).strip() for x in (account_ids or []) if str(x).strip()}
+        items = []
+        for k, v in data.items():
+            if not isinstance(v, dict):
+                continue
+            if k in wanted or str(v.get("email") or "") in wanted:
+                items.append((k, v))
+
+    accounts_out: list[dict[str, Any]] = []
+    skipped = 0
+    for aid, entry in items:
+        rec = build_cliproxyapi_export_record(entry, aid=str(aid))
+        if not rec:
+            skipped += 1
+            continue
+        accounts_out.append(rec)
+
+    payload: dict[str, Any] = {
+        "type": "cliproxyapi-auth-bundle",
+        "version": 1,
+        "exported_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "source": "grokcli-2api",
+        "accounts": accounts_out,
+    }
+    if skipped:
+        payload["skipped_no_token"] = skipped
+    return payload
 
 
 def merge_normalized_accounts(
@@ -896,11 +1257,21 @@ def import_auth_payloads_bulk(
         dry = collect_normalized_entries(raw)
         if not dry.get("ok"):
             parse_errors += 1
-            file_results.append({"index": idx, "ok": False, "error": dry.get("error") or "parse failed"})
+            file_results.append({
+                "index": idx,
+                "ok": False,
+                "error": dry.get("error") or "parse failed",
+                "format": dry.get("format"),
+            })
             continue
         entries = dry.get("normalized") or {}
         normalized.update(entries)
-        file_results.append({"index": idx, "ok": True, "count": len(entries)})
+        file_results.append({
+            "index": idx,
+            "ok": True,
+            "count": len(entries),
+            "format": dry.get("format"),
+        })
 
     if not normalized:
         return {
@@ -916,294 +1287,66 @@ def import_auth_payloads_bulk(
     result["files"] = len(payloads)
     result["parse_errors"] = parse_errors
     result["file_results"] = file_results
+    cpa_files = sum(1 for fr in file_results if fr.get("ok") and fr.get("format") == "cliproxyapi")
+    # annotate per-file format from collect_normalized_entries
+    # (re-run not needed — stash during loop below if present)
     if parse_errors:
         result["message"] = (
             f"批量导入完成：{result.get('count', 0)} 个账号，{parse_errors} 个文件失败"
         )
     else:
         result["message"] = f"批量导入完成：{result.get('count', 0)} 个账号"
+    if cpa_files:
+        result["cliproxyapi_files"] = cpa_files
+        result["message"] = (
+            f"CLIProxyAPI 导入完成：{result.get('count', 0)} 个账号"
+            + (f"（{parse_errors} 个文件失败）" if parse_errors else "")
+        )
     return result
 
 
 def import_auth_payload(
-    raw: str | dict[str, Any], *, merge: bool = True
+    raw: str | dict[str, Any] | list[Any], *, merge: bool = True
 ) -> dict[str, Any]:
-    """
-    Import credentials into auth.json (multi-account safe).
+    """Import credentials (multi-account safe).
 
     Accepts:
       - full auth.json object { "https://auth.x.ai::uuid": { key, email, ... }, ... }
       - single entry object { key, email, ... }
       - { "token"|"key"|"access_token": "eyJ...", "email"?, "account_id"? }
       - export wrapper { "auth": { ... }, "count": N } from export_auth_payload
+      - CLIProxyAPI single auth file { type:xai|codex, access_token, refresh_token, expired, ... }
+      - CLIProxyAPI bundle { type:cliproxyapi-auth-bundle, accounts:[...] }
+      - list of CPA / token objects
       - raw JWT string
     """
-    if isinstance(raw, str):
-        text = raw.strip()
-        if not text:
-            return {"ok": False, "error": "empty payload"}
-        if text.startswith("{"):
-            try:
-                parsed: Any = json.loads(text)
-            except json.JSONDecodeError as e:
-                return {"ok": False, "error": f"invalid JSON: {e}"}
-        else:
-            parsed = {"key": text}
-    else:
-        parsed = raw
-
-    if not isinstance(parsed, dict):
-        return {"ok": False, "error": "payload must be object or JWT string"}
-
-    # Unwrap export format: { "ok", "auth": {...}, "count", ... }
-    if (
-        "auth" in parsed
-        and isinstance(parsed.get("auth"), dict)
-        and "key" not in parsed
-        and "access_token" not in parsed
-        and "token" not in parsed
-    ):
-        auth_map = parsed["auth"]
-        if not auth_map:
-            return {
-                "ok": True,
-                "message": "导出文件中无账号，未变更",
-                "imported": [],
-                "auth_file": str(AUTH_FILE),
-                "total_accounts": len(read_auth_map()),
-            }
-        if all(isinstance(v, dict) for v in auth_map.values()):
-            parsed = auth_map
-
-    raw_entries: list[tuple[str | None, dict[str, Any]]] = []
-
-    looks_like_map = False
-    if parsed and all(isinstance(v, dict) for v in parsed.values()):
-        sample_vals = list(parsed.values())
-        if sample_vals and any(
-            "key" in v or "access_token" in v or "token" in v
-            for v in sample_vals
-            if isinstance(v, dict)
-        ):
-            if any(
-                ("auth.x.ai" in str(k))
-                or ("accounts.x.ai" in str(k))
-                or ("::" in str(k))
-                for k in parsed.keys()
-            ):
-                looks_like_map = True
-            elif (
-                "key" not in parsed
-                and "access_token" not in parsed
-                and "token" not in parsed
-            ):
-                looks_like_map = True
-
-    if looks_like_map:
-        for k, v in parsed.items():
-            if isinstance(v, dict) and (
-                v.get("key") or v.get("access_token") or v.get("token")
-            ):
-                raw_entries.append((str(k), dict(v)))
-    else:
-        token = (
-            parsed.get("key")
-            or parsed.get("token")
-            or parsed.get("access_token")
-            or parsed.get("accessToken")
-        )
-        if not token or not isinstance(token, str):
-            return {
-                "ok": False,
-                "error": "missing token/key. Provide JWT or auth.json entry.",
-            }
-        account_id = (
-            parsed.get("account_id") or parsed.get("id") or parsed.get("auth_key")
-        )
-        entry: dict[str, Any] = {
-            "key": token,
-            "auth_mode": parsed.get("auth_mode") or "imported",
-            "create_time": parsed.get("create_time")
-            or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    dry = collect_normalized_entries(raw)
+    if not dry.get("ok"):
+        return {
+            "ok": False,
+            "error": dry.get("error") or "parse failed",
+            "imported": [],
+            "format": dry.get("format"),
         }
-        if parsed.get("expires_at") is not None:
-            entry["expires_at"] = parsed["expires_at"]
-        if parsed.get("refresh_token"):
-            entry["refresh_token"] = parsed["refresh_token"]
-        for field in (
-            "email",
-            "user_id",
-            "team_id",
-            "first_name",
-            "last_name",
-            "principal_type",
-            "oidc_client_id",
-            "oidc_issuer",
-            # Persist registration SSO so it survives process restarts.
-            "sso",
-            "sso_cookie",
-            "sso_token",
-            "session_cookies",
-            "cookies",
-            "cookie",
-            "set_cookie",
-            "set-cookie",
-            "set_cookies",
-            "password",
-            "register_password",
-            "source",
-            "registration_session_id",
-            "registration_batch_id",
-            "sso_backup_path",
-        ):
-            if parsed.get(field) is not None and parsed.get(field) != "":
-                entry[field] = parsed[field]
-        if not entry.get("sso"):
-            _sso_val = get_sso_value(entry)
-            if _sso_val:
-                entry["sso"] = _sso_val
-                entry.setdefault("sso_cookie", _sso_val)
-        if not entry.get("password") and entry.get("register_password"):
-            entry["password"] = entry.get("register_password")
-        raw_entries.append((str(account_id) if account_id else None, entry))
-
-    if not raw_entries:
-        return {"ok": False, "error": "no valid account entries found"}
-
-    normalized: dict[str, dict[str, Any]] = {}
-    for pref_id, ent in raw_entries:
-        try:
-            aid, nent = _normalize_entry(ent, preferred_id=pref_id)
-        except ValueError:
-            continue
-        normalized[aid] = nent
-
+    normalized = dry.get("normalized") or {}
     if not normalized:
-        return {"ok": False, "error": "entries missing token"}
-
-    # PostgreSQL is primary. Prefer row-level upsert so registration / imports
-    # never depend on local auth.json existence.
-    try:
-        from grok2api.store.accounts_pg import enabled as pg_on, upsert_account_merged
-    except Exception:
-        pg_on = lambda: False  # type: ignore
-        upsert_account_merged = None  # type: ignore
-
-    imported = []
-    if pg_on() and upsert_account_merged is not None:
-        for aid, nent in normalized.items():
-            try:
-                actual_id = upsert_account_merged(
-                    aid, nent, merge_same_user=bool(merge)
-                ) or aid
-            except Exception as e:  # noqa: BLE001
-                return {"ok": False, "error": f"write PostgreSQL accounts failed: {e}"}
-            imported.append(
-                {
-                    "id": actual_id,
-                    "email": nent.get("email"),
-                    "user_id": nent.get("user_id"),
-                    "expires_at": nent.get("expires_at"),
-                    "has_refresh_token": bool(nent.get("refresh_token")),
-                    "token_hint": _mask_token(nent.get("key")),
-                }
-            )
-        # Pool row is created by _upsert_one (ON CONFLICT DO NOTHING). Always
-        # invalidate summary cache after registration/import — the old
-        # "if rid not in state: patch..." path never ran for new accounts
-        # because the pool row already exists, so totals stayed stale.
-        try:
-            from grok2api.pool.account_pool import invalidate_pool_summary_cache
-
-            invalidate_pool_summary_cache()
-        except Exception:
-            pass
-        # Runtime authority is PostgreSQL — no auth.json mirror write after import.
-        # Admin export serializes from PG on demand.
-        total = 0
-        try:
-            from grok2api.store.accounts_pg import count_accounts
-
-            total = int(count_accounts() or 0)
-        except Exception:
-            total = len(imported)
         return {
             "ok": True,
-            "message": f"已导入 {len(imported)} 个账号到 PostgreSQL（多账号合并={merge}）",
-            "imported": imported,
+            "message": "无账号可导入",
+            "imported": [],
+            "count": 0,
             "auth_file": str(AUTH_FILE),
-            "auth_file_role": "export_only",
-            "storage": "postgres",
-            "total_accounts": total,
+            "total_accounts": len(read_auth_map()),
+            "format": dry.get("format"),
         }
+    result = merge_normalized_accounts(normalized, merge=merge)
+    if dry.get("format"):
+        result["format"] = dry.get("format")
+        if dry.get("format") == "cliproxyapi" and result.get("ok"):
+            n = int(result.get("count") or len(result.get("imported") or []))
+            result["message"] = f"已从 CLIProxyAPI 导入 {n} 个账号（合并={merge}）"
+    return result
 
-    # File fallback only when PostgreSQL is unavailable.
-    existing: dict[str, Any] = {}
-    if merge:
-        existing = read_auth_map()
-        _backup_auth_file()
-        try:
-            normalize_auth_file_keys()
-            existing = read_auth_map()
-        except Exception:
-            pass
-
-    if merge:
-        for aid, nent in normalized.items():
-            uid = nent.get("user_id")
-            if not uid:
-                continue
-            for k in list(existing.keys()):
-                v = existing.get(k)
-                if not isinstance(v, dict):
-                    continue
-                if v.get("user_id") == uid or v.get("principal_id") == uid:
-                    del existing[k]
-        for aid, nent in normalized.items():
-            merge_durable_account_fields(nent, existing.get(aid))
-        existing.update(normalized)
-        final = existing
-    else:
-        final = normalized
-
-    try:
-        write_auth_map(final)
-        normalize_auth_file_keys()
-        final = read_auth_map()
-    except OSError as e:
-        return {"ok": False, "error": f"write auth store failed: {e}"}
-
-    try:
-        from grok2api.pool.account_pool import invalidate_pool_summary_cache
-
-        invalidate_pool_summary_cache()
-    except Exception:
-        pass
-
-    for k, e in normalized.items():
-        actual_id = k
-        for fk, fv in final.items():
-            if isinstance(fv, dict) and fv.get("key") == e.get("key"):
-                actual_id = fk
-                break
-        imported.append(
-            {
-                "id": actual_id,
-                "email": e.get("email"),
-                "user_id": e.get("user_id"),
-                "expires_at": e.get("expires_at"),
-                "has_refresh_token": bool(e.get("refresh_token")),
-                "token_hint": _mask_token(e.get("key")),
-            }
-        )
-    return {
-        "ok": True,
-        "message": f"已导入 {len(imported)} 个账号（多账号合并={merge}；storage=file）",
-        "imported": imported,
-        "auth_file": str(AUTH_FILE),
-        "storage": "file",
-        "total_accounts": len(final) if isinstance(final, dict) else 0,
-    }
 
 
 def do_refresh_all(

@@ -1293,18 +1293,69 @@ def mark_sso_reauth_failure(
 def remove_from_pool_after_renew_failure(
     account_id: str | None,
     *,
-    reason: str = "连续续期失败且无 SSO，已移出号池",
+    reason: str = "连续续期失败且无 SSO，已删除账号",
+    hard_delete: bool = True,
 ) -> dict[str, Any] | None:
-    """Keep credentials, but hard-remove the account from request rotation.
+    """After RT renew fails twice with no usable SSO.
 
-    Used when RT is present but broken, renew failed twice, and no usable SSO
-    is available for re-conversion.
+    Default ``hard_delete=True``: drop credentials + pool row so the account
+    cannot linger as a fake "total" entry. Operator asked for delete-not-keep
+    when AT cannot be renewed and SSO is missing.
+
+    ``hard_delete=False`` keeps the old soft behaviour (pool_status=expired,
+    credentials retained) for callers that still need it.
     """
     if not account_id:
         return None
-    msg = str(reason or "连续续期失败且无 SSO，已移出号池")[:300]
-    # Prefer a direct meta patch so pool_status stays "expired" (not plain
-    # disabled). Credentials remain in auth storage.
+    msg = str(reason or "连续续期失败且无 SSO，已删除账号")[:300]
+
+    if hard_delete:
+        removed = False
+        try:
+            from grok2api.pool.accounts import remove_account
+
+            removed = bool(remove_account(account_id))
+        except Exception:
+            removed = False
+        if not removed:
+            # Fallback: mutate auth map + pool meta
+            try:
+                from grok2api.upstream.oidc_auth import mark_refresh_invalid
+
+                res = mark_refresh_invalid(
+                    account_id,
+                    reason=msg,
+                    hard_delete=True,
+                )
+                removed = bool(res.get("deleted"))
+            except Exception:
+                pass
+        try:
+            from grok2api.store.pool_redis import clear_cooldown
+
+            clear_cooldown(account_id)
+        except Exception:
+            pass
+        try:
+            invalidate_pool_summary_cache()
+        except Exception:
+            pass
+        print(
+            f"  [token-refresh] HARD-deleted no-SSO account={str(account_id)[:64]} "
+            f"reason={msg[:120]} removed={removed}",
+            flush=True,
+        )
+        return {
+            "id": account_id,
+            "deleted": bool(removed),
+            "removed_from_pool": True,
+            "hard_delete": True,
+            "reason": msg,
+            "pool_status": None,
+            "enabled": False,
+        }
+
+    # Soft path (legacy): keep credentials, mark expired out of rotation.
     try:
         return patch_account_pool_meta(
             account_id,
@@ -1319,7 +1370,6 @@ def remove_from_pool_after_renew_failure(
                 "last_error": msg,
                 "disabled_reason": msg,
                 "disabled_source": "renew_fail_no_sso",
-                # Clear temporary cooldown so UI shows expired, not cooling.
                 "cooldown_until": None,
                 "cooldown_count": 0,
             },
@@ -2375,7 +2425,7 @@ def pool_summary(*, include_accounts: bool = True) -> dict[str, Any]:
     """
     if include_accounts:
         accounts = list_pool_accounts()
-        # Count by durable account status only (pool_status on the row).
+        # Exclusive buckets (same priority as SQL pool_counts).
         total = len(accounts)
         expired = cooling = quota_disabled = model_blocked = disabled = enabled = 0
         for a in accounts:
@@ -2386,20 +2436,27 @@ def pool_summary(*, include_accounts: bool = True) -> dict[str, Any]:
             if status == "quota_disabled" or a.get("disabled_for_quota"):
                 quota_disabled += 1
                 continue
-            if status == "cooldown":
+            if status == "disabled" or a.get("enabled") is False:
+                # disabled beats cooldown for display once hard-kicked
+                if status == "cooldown":
+                    # still count as disabled if enabled=false
+                    disabled += 1
+                else:
+                    disabled += 1
+                continue
+            if status == "cooldown" or a.get("in_cooldown"):
                 cooling += 1
                 continue
             if status == "model_blocked" or a.get("blocked_model_ids") or a.get("blocked_models"):
                 model_blocked += 1
                 continue
-            if status == "disabled" or a.get("enabled") is False:
-                disabled += 1
-                continue
             enabled += 1
+        live = enabled  # rotatable = normal enabled only
         return {
             "mode": get_account_mode(),
             "total": total,
-            "live": total - expired,
+            "live": live,
+            "rotatable": live,
             "enabled": enabled,
             "in_cooldown": cooling,
             "quota_disabled": quota_disabled,
@@ -2449,7 +2506,8 @@ def pool_summary(*, include_accounts: bool = True) -> dict[str, Any]:
             out = {
                 "mode": get_account_mode(),
                 "total": int(counts.get("total") or count_accounts() or 0),
-                "live": int(counts.get("live") or counts.get("total") or 0),
+                "live": int(counts.get("live") or 0),
+                "rotatable": int(counts.get("rotatable") or counts.get("live") or 0),
                 "enabled": int(counts.get("enabled") or 0),
                 "in_cooldown": int(counts.get("in_cooldown") or 0),
                 "quota_disabled": int(counts.get("quota_disabled") or 0),
@@ -2463,9 +2521,9 @@ def pool_summary(*, include_accounts: bool = True) -> dict[str, Any]:
             return out
     except Exception:
         pass
-    # Fallback: count durable status fields from account_pool meta.
+    # Fallback: count durable status fields from account_pool meta (exclusive).
     state = get_account_pool_state()
-    total = live = enabled = cooling = quota_disabled = model_blocked = expired = disabled = 0
+    total = enabled = cooling = quota_disabled = model_blocked = expired = disabled = 0
     for creds in list_live_credentials(include_expired=True, auto_refresh=False):
         total += 1
         meta = _pool_meta(creds.auth_key or "", state)
@@ -2473,24 +2531,25 @@ def pool_summary(*, include_accounts: bool = True) -> dict[str, Any]:
         if status == "expired":
             expired += 1
             continue
-        live += 1
         if status == "quota_disabled" or meta.get("disabled_for_quota"):
             quota_disabled += 1
             continue
-        if status == "cooldown":
+        if status == "disabled" or meta.get("enabled") is False:
+            disabled += 1
+            continue
+        if status == "cooldown" or is_in_cooldown(meta):
             cooling += 1
             continue
         if status == "model_blocked" or meta.get("blocked_model_ids") or meta.get("blocked_models"):
             model_blocked += 1
             continue
-        if status == "disabled" or meta.get("enabled") is False:
-            disabled += 1
-            continue
         enabled += 1
+    live = enabled
     out = {
         "mode": get_account_mode(),
         "total": total,
         "live": live,
+        "rotatable": live,
         "enabled": enabled,
         "in_cooldown": cooling,
         "quota_disabled": quota_disabled,

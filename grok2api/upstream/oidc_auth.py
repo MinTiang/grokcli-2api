@@ -1415,10 +1415,10 @@ def refresh_all_accounts(
 
         Rules (accounts still have RT, but RT is broken):
           1) always soft-mark expired so request polling skips the account
-          2) first consecutive failure: wait for next maintainer cycle
-          3) second consecutive failure:
+          2) first consecutive *transient* failure: wait for next maintainer cycle
+          3) second consecutive failure OR permanent invalid_grant:
                - if SSO exists: try SSO re-conversion once
-               - if no SSO: hard-remove from pool rotation (keep credentials)
+               - if no SSO: HARD-delete credentials + pool row (do not keep in total)
         """
         reason = str(err or "renew_failed")[:300]
         try:
@@ -1431,7 +1431,12 @@ def refresh_all_accounts(
             fail_count = 1
             sso = ""
 
-        # First failure: only leave request rotation; keep trying RT next cycle.
+        # Permanent IdP rejection (invalid_grant / revoked): do not wait for a
+        # second cycle — RT will never recover. Jump straight to SSO / delete.
+        if permanent and fail_count < 2:
+            fail_count = 2
+
+        # First transient failure: only leave request rotation; keep trying RT next cycle.
         if fail_count < 2:
             print(
                 f"  [token-refresh] renew fail #{fail_count} account={aid[:48]} "
@@ -1532,18 +1537,30 @@ def refresh_all_accounts(
                 "removed_from_pool": False,
             }
 
-        # No SSO after two consecutive RT failures: remove from pool rotation.
+        # No SSO after two consecutive RT failures: hard-delete credentials + pool.
         try:
             import grok2api.pool.account_pool as _pool
 
             _pool.remove_from_pool_after_renew_failure(
                 aid,
-                reason="连续续期失败且无 SSO，已移出号池",
+                reason="连续续期失败且无 SSO，已删除账号",
+                hard_delete=True,
             )
+        except TypeError:
+            # Older signature without hard_delete kw.
+            try:
+                import grok2api.pool.account_pool as _pool
+
+                _pool.remove_from_pool_after_renew_failure(
+                    aid,
+                    reason="连续续期失败且无 SSO，已删除账号",
+                )
+            except Exception:
+                pass
         except Exception:
             pass
         print(
-            f"  [token-refresh] renew fail #{fail_count}; no SSO — removed from pool "
+            f"  [token-refresh] renew fail #{fail_count}; no SSO — HARD-deleted "
             f"account={aid[:48]} err={reason[:120]}",
             flush=True,
         )
@@ -1551,10 +1568,11 @@ def refresh_all_accounts(
             "id": aid,
             "ok": False,
             "error": reason,
-            "reason": "no_sso_removed",
+            "reason": "no_sso_deleted",
             "renew_fail_count": fail_count,
             "sso_fallback": False,
             "removed_from_pool": True,
+            "deleted": True,
             "permanent": bool(permanent),
         }
 

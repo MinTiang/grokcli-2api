@@ -298,17 +298,17 @@
     <div class="g2a-field">
       <label for="set-history-auto-chars">自动压缩阈值（字符）</label>
       <input id="set-history-auto-chars" type="number" class="g2a-input" min="0" max="5000000" step="1000" />
-      <div class="g2a-muted" style="margin-top:4px">messages JSON 超过此长度时自动压缩；0=关闭。默认 180000</div>
+      <div class="g2a-muted" style="margin-top:4px">messages JSON 超过此长度时强制压缩；0=关闭（默认，优先智商）。仅当大会话导致上游失败时再设阈值</div>
     </div>
     <div class="g2a-field">
       <label for="set-history-keep-rounds">保留最近工具轮数</label>
       <input id="set-history-keep-rounds" type="number" class="g2a-input" min="1" max="64" step="1" />
-      <div class="g2a-muted" style="margin-top:4px">压缩时完整保留最近 N 轮 tool 调用；默认 6</div>
+      <div class="g2a-muted" style="margin-top:4px">仅在开启压缩时生效：近乎完整保留最近 N 轮 tool；默认 32（智商优先）</div>
     </div>
     <div class="g2a-field">
       <label for="set-history-tool-max">单条 tool 结果上限（字符）</label>
       <input id="set-history-tool-max" type="number" class="g2a-input" min="512" max="2000000" step="100" />
-      <div class="g2a-muted" style="margin-top:4px">超出截断；默认 12000</div>
+      <div class="g2a-muted" style="margin-top:4px">仅开启压缩时：最近轮次单条 tool 上限（head+tail）；默认 48000</div>
     </div>
     <div class="g2a-actions" style="grid-column:1/-1">
       <label class="g2a-check"><input type="checkbox" id="set-history-compact" /> 历史压缩（长工具循环时缩小请求体）</label>
@@ -460,6 +460,67 @@
   </p>
 </section>
 
+<section class="g2a-card" id="sec-cliproxyapi">
+  <div class="g2a-card-head">
+    <h2>CLIProxyAPI（CPA）导入</h2>
+    <span id="cliproxyapi-pill" class="g2a-tag">—</span>
+  </div>
+  <p class="g2a-muted" style="margin:0 0 12px;line-height:1.55">
+    配置 <a href="https://github.com/router-for-me/CLIProxyAPI" target="_blank" rel="noopener">CLIProxyAPI</a>
+    的 Management API 后，可在「账号」页把<strong>本地号池账号同步导入到 CPA auth 目录</strong>
+    （<code>POST /v0/management/auth-files</code>，写入 <code>xai-email.json</code> 等文件）。
+    需在 CPA <code>config.yaml</code> 开启 <code>remote-management</code> 并设置 management key。
+  </p>
+  <div class="g2a-form-grid">
+    <div class="g2a-field">
+      <label class="g2a-check"><input type="checkbox" id="set-cliproxyapi-enabled" /> 启用 CLIProxyAPI 导入</label>
+    </div>
+    <div class="g2a-field g2a-field-span2">
+      <label for="set-cliproxyapi-url">CLIProxyAPI URL</label>
+      <input id="set-cliproxyapi-url" type="url" class="g2a-input" placeholder="http://127.0.0.1:8317 或 http://cli-proxy-api:8317" autocomplete="off" />
+      <div class="g2a-muted" style="margin-top:4px">管理 API 根地址（不要带 /v0/management）</div>
+    </div>
+    <div class="g2a-field g2a-field-span2">
+      <label for="set-cliproxyapi-key">Management Key</label>
+      <input id="set-cliproxyapi-key" type="password" class="g2a-input" placeholder="已保存则留空不改" autocomplete="new-password" />
+      <div class="g2a-muted" style="margin-top:4px">对应 CPA <code>remote-management.secret-key</code>；请求头 <code>Authorization: Bearer …</code> / <code>X-Management-Key</code></div>
+    </div>
+    <div class="g2a-field">
+      <label class="g2a-check"><input type="checkbox" id="set-cliproxyapi-auto-push-register" /> 注册成功后自动入库 CPA</label>
+      <div class="g2a-muted" style="margin-top:4px">协议注册导入本地后立刻推送到 CPA；需同时启用并填好 URL / Key</div>
+    </div>
+    <div class="g2a-field">
+      <label for="set-cliproxyapi-concurrency">推送并发</label>
+      <input id="set-cliproxyapi-concurrency" type="number" class="g2a-input" min="1" max="16" step="1" value="4" />
+      <div class="g2a-muted" style="margin-top:4px">本地→CPA 同时上传几个账号；默认 4</div>
+    </div>
+    <div class="g2a-field">
+      <label for="set-cliproxyapi-auth-type">写入 type</label>
+      <select id="set-cliproxyapi-auth-type" class="g2a-input">
+        <option value="xai" selected>xai（推荐 · Grok Build / cli-chat-proxy）</option>
+        <option value="codex">codex</option>
+      </select>
+    </div>
+    <div class="g2a-field g2a-field-span2">
+      <label for="set-cliproxyapi-base-upstream">auth 文件 base_url</label>
+      <input id="set-cliproxyapi-base-upstream" type="url" class="g2a-input" placeholder="https://cli-chat-proxy.grok.com/v1" />
+      <div class="g2a-muted" style="margin-top:4px">写入 CPA auth JSON 的上游；Grok Build 请保持 cli-chat-proxy，勿改成 api.x.ai 以免 402</div>
+    </div>
+    <div class="g2a-field">
+      <label for="set-cliproxyapi-notes">notes 前缀</label>
+      <input id="set-cliproxyapi-notes" type="text" class="g2a-input" placeholder="grokcli-2api" />
+    </div>
+  </div>
+  <div class="g2a-actions" style="margin-top:12px;flex-wrap:wrap;gap:8px">
+    <button type="button" class="g2a-btn g2a-btn-default" id="btn-cliproxyapi-test">测试连接</button>
+  </div>
+  <pre id="cliproxyapi-test-result" class="g2a-log" style="margin-top:10px;max-height:160px;display:none"></pre>
+  <p class="g2a-muted" style="margin:10px 0 0;line-height:1.55" id="cliproxyapi-hint">
+    保存后到「账号」页：用「导入 CLIProxyAPI（选中/全部）」把库里的账号同步到 CPA。
+    「导出 CLIProxyAPI」可下载 <code>cliproxyapi-auth-bundle</code> 备份（也可手动拆文件放进 CPA auth 目录）。
+  </p>
+</section>
+
 <section class="g2a-card">
   <div class="g2a-actions" style="justify-content:space-between;flex-wrap:wrap;gap:12px">
     <div class="g2a-muted" id="settings-updated-at">—</div>
@@ -477,6 +538,6 @@
   <script src="/static/dist/api.c4edde3d16.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/state.da9974e23b.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/auth.fa7b1e0e4d.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/core.63c43151f2.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/core.d60204b9f3.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
 </body>
 </html>

@@ -217,6 +217,9 @@
     <button class="g2a-btn g2a-btn-primary" id="btn-acc-push-sub2api-selected" title="将选中账号导入到已配置的 sub2api">导入 sub2api（选中）</button>
     <button class="g2a-btn g2a-btn-default" id="btn-acc-push-sub2api-all" title="将全部账号导入到已配置的 sub2api">导入 sub2api（全部）</button>
     <button class="g2a-btn g2a-btn-default" id="btn-acc-export-sub2api-format" title="下载 sub2api 官方数据备份（type=sub2api-data，可在 sub2api「导入数据」使用）">导出 sub2api 数据</button>
+    <button class="g2a-btn g2a-btn-primary" id="btn-acc-push-cliproxyapi-selected" title="将选中账号同步到已配置的 CLIProxyAPI auth 目录">导入 CLIProxyAPI（选中）</button>
+    <button class="g2a-btn g2a-btn-default" id="btn-acc-push-cliproxyapi-all" title="将全部账号同步到已配置的 CLIProxyAPI">导入 CLIProxyAPI（全部）</button>
+    <button class="g2a-btn g2a-btn-default" id="btn-acc-export-cliproxyapi-format" title="下载 CLIProxyAPI auth 包（type=cliproxyapi-auth-bundle）">导出 CLIProxyAPI</button>
     <button class="g2a-btn g2a-btn-danger" id="btn-acc-delete-selected">删除选中</button>
     <label class="g2a-sort-wrap" for="acc-filter-sso" title="按是否保存 SSO 筛选">
       <span class="g2a-sort-label">SSO</span>
@@ -443,7 +446,7 @@
   <div class="g2a-card-head">
     <div>
       <h3>JSON 导入 / 导出</h3>
-      <p>上传 auth.json / 导出完整凭证。支持实时进度条。</p>
+      <p>上传 auth.json、CLIProxyAPI 的 <code>xai-*.json</code> / <code>type=xai|codex</code> 文件、或本系统导出的完整凭证。支持多文件与实时进度。</p>
     </div>
   </div>
   <div class="g2a-form-row g2a-import-controls">
@@ -483,6 +486,6 @@
   <script src="/static/dist/api.c4edde3d16.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/state.da9974e23b.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/auth.fa7b1e0e4d.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/core.63c43151f2.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/core.d60204b9f3.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
 </body>
 </html>

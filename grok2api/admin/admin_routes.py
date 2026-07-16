@@ -686,11 +686,13 @@ async def admin_status(request: Request):
             "mode": pool.get("mode"),
             "total": pool.get("total"),
             "live": pool.get("live"),
+            "rotatable": pool.get("rotatable") if pool.get("rotatable") is not None else pool.get("live"),
             "enabled": pool.get("enabled"),
             "in_cooldown": pool.get("in_cooldown"),
             "quota_disabled": pool.get("quota_disabled"),
             "model_blocked": pool.get("model_blocked"),
             "expired": pool.get("expired"),
+            "disabled": pool.get("disabled"),
             "source": pool.get("source") or "postgres",
         },
         "keys": key_stats,
@@ -3647,6 +3649,121 @@ async def get_sub2api_settings(
     return {"ok": True, "config": public_sub2api_config()}
 
 
+@router.get("/settings/cliproxyapi")
+async def get_cliproxyapi_settings(
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+) -> dict[str, Any]:
+    """Return redacted CLIProxyAPI push config for admin UI."""
+    require_admin(request, x_admin_token)
+    from grok2api.upstream.cliproxyapi_client import public_cliproxyapi_config
+
+    return {"ok": True, "config": public_cliproxyapi_config()}
+
+
+class CliproxyapiConfigBody(BaseModel):
+    enabled: bool | None = None
+    base_url: str | None = None
+    management_key: str | None = None
+    concurrency: int | None = Field(default=None, ge=1, le=16)
+    auto_push_on_register: bool | None = None
+    auth_type: str | None = None
+    base_upstream: str | None = None
+    notes_prefix: str | None = None
+    test: bool | None = None
+
+
+@router.put("/settings/cliproxyapi")
+async def put_cliproxyapi_settings(
+    body: CliproxyapiConfigBody,
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+) -> dict[str, Any]:
+    """Save CLIProxyAPI URL + management key. Blank key keeps previous."""
+    require_admin(request, x_admin_token)
+    from grok2api.upstream.cliproxyapi_client import (
+        public_cliproxyapi_config,
+        set_cliproxyapi_config,
+        test_connection,
+    )
+
+    patch = body.model_dump(exclude_none=True)
+    do_test = bool(patch.pop("test", False))
+    try:
+        set_cliproxyapi_config(patch, replace=False)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    out: dict[str, Any] = {"ok": True, "config": public_cliproxyapi_config()}
+    if do_test:
+        out["test"] = test_connection()
+        out["ok"] = bool(out["test"].get("ok"))
+    return out
+
+
+@router.post("/settings/cliproxyapi/test")
+async def test_cliproxyapi_settings(
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+) -> dict[str, Any]:
+    """Login/list smoke test against CPA management API."""
+    require_admin(request, x_admin_token)
+    from grok2api.upstream.cliproxyapi_client import test_connection
+
+    result = test_connection()
+    return {"ok": bool(result.get("ok")), "test": result}
+
+
+@router.post("/accounts/push-cliproxyapi")
+async def push_accounts_to_cliproxyapi(
+    body: Sub2ApiPushBody,
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+) -> dict[str, Any]:
+    """Batch push local accounts into CLIProxyAPI auth dir (selected or all)."""
+    require_admin(request, x_admin_token)
+    from grok2api.upstream.cliproxyapi_client import (
+        public_cliproxyapi_config,
+        push_accounts,
+    )
+
+    cfg = public_cliproxyapi_config()
+    if not cfg.get("base_url"):
+        raise HTTPException(
+            status_code=400,
+            detail="请先在设置页填写 CLIProxyAPI URL 与 management key",
+        )
+    if not cfg.get("has_management_key"):
+        raise HTTPException(
+            status_code=400,
+            detail="请先在设置页填写 CLIProxyAPI management key",
+        )
+    ids = body.account_ids
+    push_all = bool(body.all) or ids is None
+    if not push_all and isinstance(ids, list) and len(ids) == 0:
+        raise HTTPException(status_code=400, detail="未选择账号")
+    try:
+        result = push_accounts(
+            None if push_all else list(ids or []),
+            concurrency=body.concurrency,
+        )
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    audit_log(
+        request,
+        action="accounts.push_cliproxyapi",
+        summary=result.get("message") or "推送账号到 CLIProxyAPI",
+        target_type="pool",
+        detail={
+            "success": result.get("success"),
+            "failed": result.get("failed"),
+            "total": result.get("total"),
+            "all": push_all,
+        },
+        ok=bool(result.get("ok")),
+    )
+    return result
+
+
 class Sub2ApiConfigBody(BaseModel):
     enabled: bool | None = None
     base_url: str | None = None
@@ -3965,6 +4082,62 @@ async def export_sub2api_format(
     }
     if skipped:
         payload["skipped_no_token"] = skipped
+    return payload
+
+
+@router.post("/accounts/export-cliproxyapi-format")
+async def export_cliproxyapi_format(
+    body: Sub2ApiPushBody,
+    request: Request,
+    x_admin_token: str | None = Header(default=None, alias="X-Admin-Token"),
+) -> dict[str, Any]:
+    """Export local accounts as CLIProxyAPI auth-bundle JSON.
+
+    Shape::
+
+      {
+        "type": "cliproxyapi-auth-bundle",
+        "version": 1,
+        "exported_at": "...",
+        "accounts": [
+          {
+            "type": "xai",
+            "email": "...",
+            "access_token": "...",
+            "refresh_token": "...",
+            "expired": "2026-...",
+            "base_url": "https://cli-chat-proxy.grok.com/v1",
+            "headers": { "X-XAI-Token-Auth": "xai-grok-cli", ... },
+            ...
+          }
+        ]
+      }
+
+    Each ``accounts[]`` item is a single CPA auth-file body (same as
+    ``xai-<email>.json`` under CLIProxyAPI's auth dir). Import back via the
+    generic JSON 导入 (auto-detects CPA) or drop files into CPA auth dir.
+    """
+    require_admin(request, x_admin_token)
+    push_all = bool(body.all) or body.account_ids is None
+    ids = None if push_all else [str(x).strip() for x in (body.account_ids or []) if str(x).strip()]
+    if not push_all and not ids:
+        raise HTTPException(status_code=400, detail="未选择账号")
+    payload = accounts.export_cliproxyapi_payload(
+        account_ids=ids,
+        push_all=push_all,
+    )
+    audit_log(
+        request,
+        action="accounts.export_cliproxyapi",
+        summary=f"导出 CLIProxyAPI 格式 {len(payload.get('accounts') or [])} 个账号",
+        target_type="pool",
+        detail={
+            "count": len(payload.get("accounts") or []),
+            "all": push_all,
+            "selected": 0 if push_all else len(ids or []),
+        },
+        ok=True,
+    )
     return payload
 
 

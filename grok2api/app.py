@@ -56,7 +56,7 @@ import grok2api.config as _config
 import grok2api.protocol.history_compact as history_compact
 from grok2api.upstream.models import load_models_from_cache, resolve_model
 
-APP_VERSION = "1.9.90"
+APP_VERSION = "1.9.91"
 
 # Per-request usage context (client IP / path / UA) for request-level ledger rows.
 _usage_request_ctx: ContextVar[dict[str, Any] | None] = ContextVar(
@@ -1648,8 +1648,9 @@ def _body_for_upstream(body: dict[str, Any]) -> dict[str, Any]:
 def _apply_history_compact(body: dict[str, Any]) -> dict[str, Any]:
     """Compact inbound messages on an OpenAI-style upstream body; stash stats.
 
-    Auto-enables when the messages JSON exceeds HISTORY_COMPACT_AUTO_CHARS so
-    Codex / long agent loops do not push 100k+ token prompts (TTFT explodes).
+    IQ-first: only runs when HISTORY_COMPACT is enabled, or when auto threshold
+    is set (>0) and messages JSON exceeds it (crash-prevention safety net).
+    Default auto threshold is 0 so full history is preserved.
     """
     force = False
     try:
@@ -2329,6 +2330,7 @@ class RequestTiming:
         "tools_req",
         "held",
         "logged",
+        "history_compact",
     )
 
     def __init__(
@@ -2358,6 +2360,8 @@ class RequestTiming:
         self.tools_req = False
         self.held = False
         self.logged = False
+        # Filled by attach_history_compact(); merged into usage detail.
+        self.history_compact: dict[str, Any] | None = None
 
     def mark_affinity(self, prefer_account: str | None = None) -> None:
         self.t_affinity_done = time.perf_counter()
@@ -2407,6 +2411,27 @@ class RequestTiming:
     def mark_held(self) -> None:
         """First model bytes were buffered by tools-preface hold policy."""
         self.held = True
+
+    def attach_history_compact(self, stats: dict[str, Any] | None) -> None:
+        """Keep compact before/after stats for usage_events (stream + non-stream)."""
+        if not isinstance(stats, dict):
+            return
+        slim = {
+            "enabled": bool(stats.get("enabled")),
+            "applied": bool(stats.get("applied")),
+            "auto": bool(stats.get("auto")),
+            "before_chars": stats.get("before_chars"),
+            "after_chars": stats.get("after_chars"),
+            "tool_rounds": stats.get("tool_rounds"),
+            "compacted_tool_msgs": stats.get("compacted_tool_msgs"),
+            "truncated_tool_msgs": stats.get("truncated_tool_msgs"),
+            "soft_summary_msgs": stats.get("soft_summary_msgs"),
+            "prefix_stable": stats.get("prefix_stable"),
+            "keep_tool_rounds": stats.get("keep_tool_rounds"),
+            "mid_tool_rounds": stats.get("mid_tool_rounds"),
+            "policy": stats.get("policy"),
+        }
+        self.history_compact = slim
 
     def mark_first_token(self, *, kind: str = "content", held: bool | None = None) -> None:
         if self.t_first_token is not None:
@@ -2474,6 +2499,9 @@ class RequestTiming:
             out["tools"] = True
         if self.held:
             out["held"] = True
+        hc = self.history_compact
+        if isinstance(hc, dict) and hc:
+            out["history_compact"] = hc
         return out
 
     def emit(self, *, ok: bool = True, first: str | None = None, error: str | None = None) -> None:
@@ -3789,7 +3817,11 @@ async def health():
             "accounts_live": pool.get("live"),
             "accounts_enabled": pool.get("enabled"),
             "accounts_total": pool.get("total"),
-            "multi_account": (pool.get("live") or 0) > 1,
+            "accounts_cooldown": pool.get("in_cooldown"),
+            "accounts_expired": pool.get("expired"),
+            "accounts_model_blocked": pool.get("model_blocked"),
+            "accounts_disabled": pool.get("disabled"),
+            "multi_account": (pool.get("total") or 0) > 1,
             # light=True avoids rescanning auth.json for min_remaining on every poll
             "token_maintainer": token_maintainer.status(light=True),
             "model_health": model_health.status(light=True),
@@ -4212,6 +4244,13 @@ async def chat_completions(
         body["prompt_cache_key"] = pck
         body["_prompt_cache_key"] = pck
         body["_prompt_cache_key_minted"] = bool(pck_minted)
+
+    try:
+        timing.attach_history_compact(
+            body.get("_history_compact") if isinstance(body, dict) else None
+        )
+    except Exception:
+        pass
 
     # Bind client-registered tools so OpenAI chat outbound remaps
     # Update/StrReplace → Edit for Claude Code via sub2api.
@@ -5653,6 +5692,13 @@ async def anthropic_messages(
         body["_prompt_cache_key"] = pck
         body["_prompt_cache_key_minted"] = bool(pck_minted)
 
+    try:
+        timing.attach_history_compact(
+            body.get("_history_compact") if isinstance(body, dict) else None
+        )
+    except Exception:
+        pass
+
     compact_hdr = {
         **_history_compact_headers(body),
         **_prompt_stabilize_headers(body),
@@ -6099,6 +6145,13 @@ async def openai_responses(
             body["prompt_cache_key"] = req_body.get("_prompt_cache_key")
             body["_prompt_cache_key"] = req_body.get("_prompt_cache_key")
             body["_prompt_cache_key_minted"] = bool(req_body.get("_prompt_cache_key_minted"))
+
+    try:
+        timing.attach_history_compact(
+            body.get("_history_compact") if isinstance(body, dict) else None
+        )
+    except Exception:
+        pass
 
     compact_hdr = {
         **_history_compact_headers(body),

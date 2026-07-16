@@ -340,21 +340,27 @@ def get_pool_meta(account_id: str) -> dict[str, Any]:
 def pool_counts(*, maintain: bool = False) -> dict[str, int]:
     """Count accounts by durable account_pool status fields.
 
-    Status is stored on each account row (`pool_status` / `disabled_for_quota` /
-    `enabled`). Overview numbers are just SQL GROUP counts of that state —
-    no wall-clock re-derivation from cooldown_until / token expiry.
+    Categories are **mutually exclusive** (priority order):
+      expired > quota_disabled > disabled > cooldown > model_blocked > enabled
+
+    ``live`` / ``rotatable`` = accounts currently eligible for request rotation
+    (enabled + normal + not quota-disabled). Cool/expired/disabled are NOT live.
+
+    ``total`` = every row in ``accounts`` (credentials still stored).
     """
+    empty = {
+        "total": 0,
+        "enabled": 0,
+        "quota_disabled": 0,
+        "in_cooldown": 0,
+        "model_blocked": 0,
+        "live": 0,
+        "rotatable": 0,
+        "expired": 0,
+        "disabled": 0,
+    }
     if not enabled():
-        return {
-            "total": 0,
-            "enabled": 0,
-            "quota_disabled": 0,
-            "in_cooldown": 0,
-            "model_blocked": 0,
-            "live": 0,
-            "expired": 0,
-            "disabled": 0,
-        }
+        return dict(empty)
     with connection() as conn:
         with conn.cursor() as cur:
             if maintain:
@@ -369,50 +375,54 @@ def pool_counts(*, maintain: bool = False) -> dict[str, int]:
                     )
                 except Exception:
                     pass
-            # Count every account once by its durable pool_status.
-            # Missing pool row → treat as normal (eligible for rotation).
+            # Exclusive status classification — every account counted once.
+            # Missing pool row → treat as normal/enabled (eligible for rotation).
             cur.execute(
                 """
+                WITH base AS (
+                  SELECT
+                    a.id AS account_id,
+                    COALESCE(ap.pool_status, 'normal') AS pool_status,
+                    COALESCE(ap.enabled, true) AS enabled,
+                    COALESCE(ap.disabled_for_quota, false) AS disabled_for_quota,
+                    CASE
+                      WHEN ap.blocked_models IS NOT NULL
+                       AND ap.blocked_models <> '{}'::jsonb
+                       AND ap.blocked_models <> 'null'::jsonb
+                      THEN true ELSE false
+                    END AS has_model_blocks
+                  FROM accounts a
+                  LEFT JOIN account_pool ap ON ap.account_id = a.id
+                ),
+                classified AS (
+                  SELECT
+                    account_id,
+                    CASE
+                      WHEN pool_status = 'expired' THEN 'expired'
+                      WHEN disabled_for_quota OR pool_status = 'quota_disabled'
+                        THEN 'quota_disabled'
+                      WHEN pool_status = 'disabled'
+                        OR (enabled = false AND pool_status NOT IN (
+                              'expired', 'quota_disabled', 'cooldown', 'model_blocked'
+                            ))
+                        THEN 'disabled'
+                      WHEN pool_status = 'cooldown' THEN 'cooldown'
+                      WHEN pool_status = 'model_blocked' OR has_model_blocks
+                        THEN 'model_blocked'
+                      ELSE 'enabled'
+                    END AS bucket
+                  FROM base
+                )
                 SELECT
                   COUNT(*) AS total,
-                  COUNT(*) FILTER (
-                    WHERE COALESCE(ap.pool_status, 'normal') = 'normal'
-                      AND COALESCE(ap.enabled, true) = true
-                      AND COALESCE(ap.disabled_for_quota, false) = false
-                  ) AS enabled,
-                  COUNT(*) FILTER (
-                    WHERE COALESCE(ap.disabled_for_quota, false) = true
-                       OR COALESCE(ap.pool_status, 'normal') = 'quota_disabled'
-                  ) AS quota_disabled,
-                  COUNT(*) FILTER (
-                    WHERE COALESCE(ap.pool_status, 'normal') = 'cooldown'
-                  ) AS in_cooldown,
-                  COUNT(*) FILTER (
-                    WHERE COALESCE(ap.pool_status, 'normal') = 'model_blocked'
-                       OR (
-                         ap.blocked_models IS NOT NULL
-                         AND ap.blocked_models <> '{}'::jsonb
-                         AND ap.blocked_models <> 'null'::jsonb
-                       )
-                  ) AS model_blocked,
-                  COUNT(*) FILTER (
-                    WHERE COALESCE(ap.pool_status, 'normal') <> 'expired'
-                  ) AS live,
-                  COUNT(*) FILTER (
-                    WHERE COALESCE(ap.pool_status, 'normal') = 'expired'
-                  ) AS expired,
-                  COUNT(*) FILTER (
-                    WHERE COALESCE(ap.pool_status, 'normal') = 'disabled'
-                       OR (
-                         COALESCE(ap.enabled, true) = false
-                         AND COALESCE(ap.disabled_for_quota, false) = false
-                         AND COALESCE(ap.pool_status, 'normal') NOT IN (
-                           'expired', 'quota_disabled', 'cooldown', 'model_blocked'
-                         )
-                       )
-                  ) AS disabled
-                FROM accounts a
-                LEFT JOIN account_pool ap ON ap.account_id = a.id
+                  COUNT(*) FILTER (WHERE bucket = 'enabled') AS enabled,
+                  COUNT(*) FILTER (WHERE bucket = 'quota_disabled') AS quota_disabled,
+                  COUNT(*) FILTER (WHERE bucket = 'cooldown') AS in_cooldown,
+                  COUNT(*) FILTER (WHERE bucket = 'model_blocked') AS model_blocked,
+                  COUNT(*) FILTER (WHERE bucket = 'enabled') AS live,
+                  COUNT(*) FILTER (WHERE bucket = 'expired') AS expired,
+                  COUNT(*) FILTER (WHERE bucket = 'disabled') AS disabled
+                FROM classified
                 """
             )
             r = cur.fetchone() or (0, 0, 0, 0, 0, 0, 0, 0)
@@ -421,13 +431,17 @@ def pool_counts(*, maintain: bool = False) -> dict[str, int]:
                 conn.commit()
             except Exception:
                 pass
+    total = int(r[0] or 0)
+    enabled_n = int(r[1] or 0)
+    live_n = int(r[5] or 0)  # same as enabled under exclusive rules
     return {
-        "total": int(r[0] or 0),
-        "enabled": int(r[1] or 0),
+        "total": total,
+        "enabled": enabled_n,
         "quota_disabled": int(r[2] or 0),
         "in_cooldown": int(r[3] or 0),
         "model_blocked": int(r[4] or 0),
-        "live": int(r[5] or 0),
+        "live": live_n,
+        "rotatable": live_n,
         "expired": int(r[6] or 0),
         "disabled": int(r[7] or 0) if len(r) > 7 else 0,
     }
@@ -447,6 +461,7 @@ def refresh_pool_summary_snapshot() -> dict[str, Any]:
         "mode": mode,
         "total": int(counts.get("total") or 0),
         "live": int(counts.get("live") or 0),
+        "rotatable": int(counts.get("rotatable") or counts.get("live") or 0),
         "enabled": int(counts.get("enabled") or 0),
         "in_cooldown": int(counts.get("in_cooldown") or 0),
         "quota_disabled": int(counts.get("quota_disabled") or 0),

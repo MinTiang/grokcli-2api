@@ -1166,8 +1166,8 @@ function renderStats() {
     <div class="stat"><div class="label">API Base</div><div class="value mono">${esc(d.api_base || s.api_base || "")}</div></div>
     <div class="stat"><div class="label">CLI 版本</div><div class="value mono">${esc(d.cli_version || s.cli_version || "")}</div>
       <div class="sub">上游 ${esc(d.upstream || s.upstream || "")}</div></div>
-    <div class="stat"><div class="label">账号池</div><div class="value">${pool.total ?? acc.account_count ?? 0} 总数 · ${pool.enabled ?? acc.active_count ?? 0} 启用 / ${pool.live ?? acc.active_count ?? 0} 有效</div>
-      <div class="sub">模式 ${esc(d.account_mode || s.account_mode || "—")} · 冷却 ${pool.in_cooldown ?? 0} · 过期 ${pool.expired ?? 0} · 额度禁用 ${pool.quota_disabled ?? 0}</div></div>
+    <div class="stat"><div class="label">账号池</div><div class="value">${pool.total ?? acc.account_count ?? 0} 总量 · ${pool.live ?? pool.enabled ?? acc.active_count ?? 0} 可轮询</div>
+      <div class="sub">模式 ${esc(d.account_mode || s.account_mode || "—")} · 冷却 ${pool.in_cooldown ?? 0} · 过期 ${pool.expired ?? 0} · 模型封禁 ${pool.model_blocked ?? 0} · 额度禁用 ${pool.quota_disabled ?? 0} · 禁用 ${pool.disabled ?? 0}</div></div>
     <div class="stat"><div class="label">API Keys</div><div class="value">${keys.enabled ?? 0} 启用 / ${keys.total ?? 0}</div>
       <div class="sub">请求累计 ${keys.total_requests ?? 0} · 鉴权 ${keys.auth_required ? "开启" : "关闭"}</div></div>
     <div class="stat"><div class="label">今日用量</div><div class="value mono">${fmtNum((d.usage || s.usage || {}).today_tokens || 0)} token</div>
@@ -1341,7 +1341,7 @@ function renderAccountsPage() {
         p.pool_status === "expired"
         || a.expired
         || p.token_expired_at
-        || ["failed","expired","sso_failed","no_sso_removed","sso_attempt"].includes(String(p.last_renew_status || ""))
+        || ["failed","expired","sso_failed","no_sso_removed","no_sso_deleted","sso_attempt"].includes(String(p.last_renew_status || ""))
       );
       const renewFails = Number(p.renew_fail_count || 0) || 0;
       const streak = Number(p.consecutive_fails || 0) || 0;
@@ -1356,7 +1356,7 @@ function renderAccountsPage() {
           "已过期，已移出轮询",
           renewFails ? `续期失败×${renewFails}` : "",
           p.last_renew_error || p.token_expired_reason || p.last_error || "",
-          p.last_renew_status === "no_sso_removed" ? "无 SSO，已移出号池" : "",
+          p.last_renew_status === "no_sso_removed" || p.last_renew_status === "no_sso_deleted" ? "无 SSO，续不上 AT 已删除" : "",
           p.last_renew_status === "sso_failed" ? "SSO 重登失败" : "",
         ].filter(Boolean).join(" · ");
         poolLabel = `<span class="g2a-tag bad" title="${esc(tip)}">过期</span>`;
@@ -1610,7 +1610,7 @@ function renderOneAccountRow(account) {
     p.pool_status === "expired"
     || a.expired
     || p.token_expired_at
-    || ["failed","expired","sso_failed","no_sso_removed","sso_attempt"].includes(String(p.last_renew_status || ""))
+    || ["failed","expired","sso_failed","no_sso_removed","no_sso_deleted","sso_attempt"].includes(String(p.last_renew_status || ""))
   );
   const renewFails = Number(p.renew_fail_count || 0) || 0;
   let poolLabel;
@@ -1620,7 +1620,7 @@ function renderOneAccountRow(account) {
       "已过期，已移出轮询",
       renewFails ? `续期失败×${renewFails}` : "",
       p.last_renew_error || p.token_expired_reason || p.last_error || "",
-      p.last_renew_status === "no_sso_removed" ? "无 SSO，已移出号池" : "",
+      p.last_renew_status === "no_sso_removed" || p.last_renew_status === "no_sso_deleted" ? "无 SSO，续不上 AT 已删除" : "",
     ].filter(Boolean).join(" · ");
     poolLabel = `<span class="g2a-tag bad" title="${esc(tip)}">过期</span>`;
   }
@@ -4835,11 +4835,47 @@ async function exportAllAccounts() {
 }
 
 async function importJsonFiles() {
-  const input = $("import-file");
+  return importAccountJsonFiles({
+    inputId: "import-file",
+    buttonId: "btn-import",
+    nameLabelId: "import-file-name",
+    label: "JSON",
+    emptyMsg: "请先选择 JSON 文件",
+  });
+}
+
+/** Import CLIProxyAPI auth files (same backend as JSON import; CPA auto-detected). */
+async function importCliproxyapiFiles() {
+  return importAccountJsonFiles({
+    inputId: "import-cliproxyapi-file",
+    buttonId: "btn-acc-import-cliproxyapi",
+    nameLabelId: null,
+    label: "CLIProxyAPI",
+    emptyMsg: "请选择 CLIProxyAPI 的 auth JSON（xai-*.json / type=xai|codex / bundle）",
+    forceMerge: true,
+  });
+}
+
+/**
+ * Shared multi-file import against /accounts/import-files.
+ * Used by generic JSON import and the dedicated CLIProxyAPI button.
+ */
+async function importAccountJsonFiles({
+  inputId = "import-file",
+  buttonId = "btn-import",
+  nameLabelId = "import-file-name",
+  label = "JSON",
+  emptyMsg = "请先选择文件",
+  forceMerge = null,
+} = {}) {
+  const input = $(inputId);
   const files = input && input.files;
-  if (!files || !files.length) return toast("请先选择 JSON 文件", false);
-  const merge = ($("import-merge") && $("import-merge").checked) ? "true" : "false";
-  const btn = $("btn-import");
+  if (!files || !files.length) return toast(emptyMsg, false);
+  let merge;
+  if (forceMerge === true) merge = "true";
+  else if (forceMerge === false) merge = "false";
+  else merge = ($("import-merge") && $("import-merge").checked) ? "true" : "false";
+  const btn = $(buttonId);
   if (btn) {
     btn.disabled = true;
     if (!btn.dataset.label) btn.dataset.label = btn.textContent;
@@ -4848,7 +4884,7 @@ async function importJsonFiles() {
   showJsonIoProgress(true);
   setJsonIoProgress({
     percent: 0,
-    label: `开始导入 ${files.length} 个 JSON…`,
+    label: `开始导入 ${files.length} 个 ${label} 文件…`,
     detail: "提交任务中",
     done: 0,
     total: files.length,
@@ -4856,7 +4892,11 @@ async function importJsonFiles() {
     fail: 0,
     status: "queued",
   });
-  setLogPanel("json-io-result", `开始导入 ${files.length} 个 JSON…\n提交后台任务…`, { forceShow: true });
+  setLogPanel(
+    "json-io-result",
+    `开始导入 ${files.length} 个 ${label} 文件…\n提交后台任务…`,
+    { forceShow: true }
+  );
   try {
     const fd = new FormData();
     for (let i = 0; i < files.length; i++) fd.append("files", files[i]);
@@ -4912,9 +4952,14 @@ async function importJsonFiles() {
         fail: totalFailed,
         status: totalFailed ? "partial" : "done",
       });
-      toast(files.length > 1 ? `批量导入完成：${totalImported} 账号，${totalFailed} 文件失败` : (lastMessage || `已导入 ${totalImported} 个账号`), totalFailed === 0);
+      toast(
+        files.length > 1
+          ? `${label} 导入完成：${totalImported} 账号，${totalFailed} 文件失败`
+          : (lastMessage || `已导入 ${totalImported} 个账号`),
+        totalFailed === 0
+      );
       if (input) input.value = "";
-      if ($("import-file-name")) $("import-file-name").textContent = "未选择文件";
+      if (nameLabelId && $(nameLabelId)) $(nameLabelId).textContent = "未选择文件";
       try { await loadAccountsPage({ reset: true }); } catch (_) { await loadDashboard(); }
       return;
     }
@@ -4932,9 +4977,12 @@ async function importJsonFiles() {
         fail: parseErrors,
         status: parseErrors ? "partial" : "done",
       });
-      toast(started.message || `导入完成：${count} 个账号` + (parseErrors ? `，${parseErrors} 个文件失败` : ""), parseErrors === 0);
+      toast(
+        started.message || `导入完成：${count} 个账号` + (parseErrors ? `，${parseErrors} 个文件失败` : ""),
+        parseErrors === 0
+      );
       if (input) input.value = "";
-      if ($("import-file-name")) $("import-file-name").textContent = "未选择文件";
+      if (nameLabelId && $(nameLabelId)) $(nameLabelId).textContent = "未选择文件";
       try { await loadAccountsPage({ reset: true }); } catch (_) { await loadDashboard(); }
       return;
     }
@@ -4963,11 +5011,11 @@ async function importJsonFiles() {
     }
     if (btn) btn.textContent = `导入中 ${finalJob.done || files.length}/${finalJob.total || files.length}`;
     toast(
-      finalJob.message || `导入完成：${finalJob.count || 0} 个账号`,
+      finalJob.message || `${label} 导入完成：${finalJob.count || 0} 个账号`,
       st !== "error" && !(finalJob.fail > 0 && !(finalJob.count > 0))
     );
     if (input) input.value = "";
-    if ($("import-file-name")) $("import-file-name").textContent = "未选择文件";
+    if (nameLabelId && $(nameLabelId)) $(nameLabelId).textContent = "未选择文件";
     try { await loadAccountsPage({ reset: true }); } catch (_) { await loadDashboard(); }
   } catch (e) {
     setJsonIoProgress({
@@ -4980,7 +5028,7 @@ async function importJsonFiles() {
   } finally {
     if (btn) {
       btn.disabled = false;
-      btn.textContent = btn.dataset.label || "导入文件";
+      btn.textContent = btn.dataset.label || (buttonId === "btn-acc-import-cliproxyapi" ? "导入 CLIProxyAPI" : "导入文件");
     }
   }
 }
@@ -5565,6 +5613,149 @@ function fillSub2apiForm(cfg) {
   }
 }
 
+function fillCliproxyapiForm(cfg) {
+  cfg = cfg || {};
+  if ($("set-cliproxyapi-enabled")) $("set-cliproxyapi-enabled").checked = !!cfg.enabled;
+  if ($("set-cliproxyapi-url")) $("set-cliproxyapi-url").value = cfg.base_url || "";
+  if ($("set-cliproxyapi-key")) {
+    $("set-cliproxyapi-key").value = "";
+    $("set-cliproxyapi-key").placeholder = cfg.has_management_key ? "已保存，留空不改" : "Management Key";
+  }
+  if ($("set-cliproxyapi-auto-push-register")) {
+    $("set-cliproxyapi-auto-push-register").checked = !!cfg.auto_push_on_register;
+  }
+  if ($("set-cliproxyapi-concurrency")) {
+    $("set-cliproxyapi-concurrency").value = cfg.concurrency != null ? cfg.concurrency : 4;
+  }
+  if ($("set-cliproxyapi-auth-type")) {
+    $("set-cliproxyapi-auth-type").value = cfg.auth_type || "xai";
+  }
+  if ($("set-cliproxyapi-base-upstream")) {
+    $("set-cliproxyapi-base-upstream").value =
+      cfg.base_upstream || "https://cli-chat-proxy.grok.com/v1";
+  }
+  if ($("set-cliproxyapi-notes")) {
+    $("set-cliproxyapi-notes").value = cfg.notes_prefix || "grokcli-2api";
+  }
+  const pill = $("cliproxyapi-pill");
+  if (pill) {
+    if (cfg.base_url && cfg.has_management_key) {
+      pill.textContent = "已配置";
+      pill.className = "g2a-tag g2a-tag-ok";
+    } else if (cfg.base_url) {
+      pill.textContent = "缺 Key";
+      pill.className = "g2a-tag g2a-tag-warn";
+    } else {
+      pill.textContent = "未配置";
+      pill.className = "g2a-tag";
+    }
+  }
+}
+
+function collectCliproxyapiPatch() {
+  if (!$("set-cliproxyapi-url") && !$("set-cliproxyapi-key")) return null;
+  const patch = {
+    enabled: !!( $("set-cliproxyapi-enabled") && $("set-cliproxyapi-enabled").checked ),
+    base_url: $("set-cliproxyapi-url") ? ($("set-cliproxyapi-url").value || "").trim() : "",
+    auto_push_on_register: !!(
+      $("set-cliproxyapi-auto-push-register") && $("set-cliproxyapi-auto-push-register").checked
+    ),
+    notes_prefix: $("set-cliproxyapi-notes")
+      ? (($("set-cliproxyapi-notes").value || "").trim() || "grokcli-2api")
+      : "grokcli-2api",
+    auth_type: $("set-cliproxyapi-auth-type")
+      ? ($("set-cliproxyapi-auth-type").value || "xai")
+      : "xai",
+    base_upstream: $("set-cliproxyapi-base-upstream")
+      ? (($("set-cliproxyapi-base-upstream").value || "").trim() ||
+          "https://cli-chat-proxy.grok.com/v1")
+      : "https://cli-chat-proxy.grok.com/v1",
+  };
+  const conc = $("set-cliproxyapi-concurrency")
+    ? ($("set-cliproxyapi-concurrency").value || "").trim()
+    : "";
+  if (conc !== "") patch.concurrency = Number(conc);
+  const key = $("set-cliproxyapi-key") ? ($("set-cliproxyapi-key").value || "") : "";
+  if (key) patch.management_key = key;
+  return patch;
+}
+
+async function saveCliproxyapiConfig(opts) {
+  opts = opts || {};
+  const patch = collectCliproxyapiPatch() || {};
+  if (opts.test) patch.test = true;
+  const r = await api("/settings/cliproxyapi", {
+    method: "PUT",
+    body: JSON.stringify(patch),
+  });
+  if (r && r.config) fillCliproxyapiForm(r.config);
+  if (r && r.ok === false) {
+    throw new Error((r.test && r.test.error) || r.error || "CLIProxyAPI 配置保存失败");
+  }
+  return r;
+}
+
+async function testCliproxyapiConnection() {
+  const pre = $("cliproxyapi-test-result");
+  if (pre) {
+    pre.style.display = "block";
+    pre.textContent = "测试中…";
+  }
+  try {
+    await saveCliproxyapiConfig({});
+    const r = await api("/settings/cliproxyapi/test", { method: "POST", body: "{}" });
+    if (pre) pre.textContent = JSON.stringify(r, null, 2);
+    const ok = !!(r && (r.ok || (r.test && r.test.ok)));
+    const msg = ok
+      ? (r.test && r.test.message) || r.message || "连接成功"
+      : (r && r.test && r.test.error) || (r && r.error) || "失败";
+    toast(msg, !ok);
+    return r;
+  } catch (e) {
+    if (pre) pre.textContent = String(e.message || e);
+    toast(e.message || String(e), true);
+    throw e;
+  }
+}
+
+async function pushAccountsToCliproxyapi({ all = false } = {}) {
+  let body;
+  if (all) {
+    if (!confirm("确认将【全部账号】同步导入到 CLIProxyAPI？")) return;
+    body = { all: true };
+  } else {
+    const ids = Array.from(selectedAccountIds || []);
+    if (!ids.length) {
+      toast("请先勾选要导入的账号", false);
+      return;
+    }
+    if (!confirm(`确认将选中的 ${ids.length} 个账号同步导入到 CLIProxyAPI？`)) return;
+    body = { account_ids: ids };
+  }
+  toast(all ? "正在同步全部账号到 CLIProxyAPI…" : "正在同步选中账号到 CLIProxyAPI…");
+  try {
+    const r = await api("/accounts/push-cliproxyapi", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    const ok = r && r.success != null ? r.success : 0;
+    const fail = r && r.failed != null ? r.failed : 0;
+    const total = r && r.total != null ? r.total : ok + fail;
+    toast(
+      r.message || `CLIProxyAPI 导入完成：成功 ${ok} / 失败 ${fail} / 共 ${total}`,
+      fail !== 0
+    );
+    if (fail && r && Array.isArray(r.results)) {
+      const firstErr = r.results.find((x) => x && !x.ok);
+      if (firstErr) console.warn("cliproxyapi push sample error", firstErr);
+    }
+    return r;
+  } catch (e) {
+    toast(e.message || String(e), false);
+    throw e;
+  }
+}
+
 function collectSub2apiPatch() {
   if (!$("set-sub2api-url") && !$("set-sub2api-email")) return null;
   const patch = {
@@ -5769,6 +5960,62 @@ async function exportSub2apiFormat() {
   }
 }
 
+async function exportCliproxyapiFormat() {
+  const ids = Array.from(selectedAccountIds || []);
+  const body = ids.length ? { account_ids: ids } : { all: true };
+  if (
+    !ids.length &&
+    !confirm(
+      "未选择账号，将导出全部账号为 CLIProxyAPI auth 包（type=cliproxyapi-auth-bundle）。继续？"
+    )
+  ) {
+    return;
+  }
+  try {
+    const r = await api("/accounts/export-cliproxyapi-format", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    let payload = r;
+    if (!payload || payload.type !== "cliproxyapi-auth-bundle") {
+      // tolerate accidental wrappers
+      if (r && Array.isArray(r.accounts)) {
+        payload = {
+          type: "cliproxyapi-auth-bundle",
+          version: 1,
+          exported_at: new Date().toISOString(),
+          source: "grokcli-2api",
+          accounts: r.accounts,
+        };
+      }
+    }
+    if (!payload || !Array.isArray(payload.accounts)) {
+      throw new Error("导出结果不是 cliproxyapi-auth-bundle 格式");
+    }
+    if (!payload.type) payload.type = "cliproxyapi-auth-bundle";
+    if (!payload.version) payload.version = 1;
+    if (!payload.exported_at) payload.exported_at = new Date().toISOString();
+    const count = payload.accounts.length;
+    const blob = new Blob([JSON.stringify(payload, null, 2)], {
+      type: "application/json",
+    });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `cliproxyapi-auth-bundle-${Date.now()}.json`;
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => {
+      URL.revokeObjectURL(a.href);
+      a.remove();
+    }, 1000);
+    toast(
+      `已导出 CLIProxyAPI：${count} 个账号（可再「导入文件」回本系统，或拆成单文件放进 CPA auth 目录）`
+    );
+  } catch (e) {
+    toast(e.message || String(e), true);
+  }
+}
+
 function bindSub2apiUi() {
   on("btn-sub2api-test", "onclick", () => { testSub2apiConnection().catch(() => {}); });
   on("btn-sub2api-load-groups", "onclick", () => { loadSub2apiGroups().catch((e) => toast(e.message || String(e), true)); });
@@ -5787,6 +6034,10 @@ function bindSub2apiUi() {
   on("btn-acc-push-sub2api-selected", "onclick", () => { pushAccountsToSub2api({ all: false }).catch(() => {}); });
   on("btn-acc-push-sub2api-all", "onclick", () => { pushAccountsToSub2api({ all: true }).catch(() => {}); });
   on("btn-acc-export-sub2api-format", "onclick", () => { exportSub2apiFormat().catch(() => {}); });
+  on("btn-acc-export-cliproxyapi-format", "onclick", () => { exportCliproxyapiFormat().catch(() => {}); });
+  on("btn-acc-push-cliproxyapi-selected", "onclick", () => { pushAccountsToCliproxyapi({ all: false }).catch(() => {}); });
+  on("btn-acc-push-cliproxyapi-all", "onclick", () => { pushAccountsToCliproxyapi({ all: true }).catch(() => {}); });
+  on("btn-cliproxyapi-test", "onclick", () => { testCliproxyapiConnection().catch(() => {}); });
 }
 // bind once when DOM ready (core.js loads at end of body)
 try { bindSub2apiUi(); } catch (_) {}
@@ -5863,6 +6114,7 @@ function fillSystemSettingsForm(s) {
   try { updateOutboundProxyHint(s); } catch (_) {}
   // sub2api push config
   try { fillSub2apiForm(s && s.sub2api_config); } catch (_) {}
+  try { fillCliproxyapiForm(s && s.cliproxyapi_config); } catch (_) {}
   const pill = $("pwd-env-pill");
   if (pill) {
     if (s.admin_password_in_store || (s.has_admin_password && !s.admin_password_from_env)) {
@@ -5976,6 +6228,11 @@ function collectSystemSettingsPatch() {
     const s2 = collectSub2apiPatch();
     if (s2) patch.sub2api_config = s2;
   } catch (_) {}
+  // CLIProxyAPI
+  try {
+    const cpa = collectCliproxyapiPatch();
+    if (cpa) patch.cliproxyapi_config = cpa;
+  } catch (_) {}
   return patch;
 }
 
@@ -6041,6 +6298,7 @@ async function saveSystemSettings() {
     // Persist sub2api via dedicated endpoint FIRST so password is never dropped
     // by the redacted public settings response from PUT /settings.
     let s2err = null;
+    let cpaErr = null;
     try {
       if ($("set-sub2api-url") || $("set-sub2api-email")) {
         await saveSub2apiConfig({});
@@ -6049,8 +6307,17 @@ async function saveSystemSettings() {
       s2err = e;
       console.warn("sub2api save failed", e);
     }
+    try {
+      if ($("set-cliproxyapi-url") || $("set-cliproxyapi-key")) {
+        await saveCliproxyapiConfig({});
+      }
+    } catch (e) {
+      cpaErr = e;
+      console.warn("cliproxyapi save failed", e);
+    }
     // Avoid double-writing / redacting secrets through general settings path.
     if (patch.sub2api_config) delete patch.sub2api_config;
+    if (patch.cliproxyapi_config) delete patch.cliproxyapi_config;
     const r = await api("/settings", { method: "PUT", body: JSON.stringify(patch) });
     const s = (r && r.settings) || patch;
     if (dashCache) dashCache.settings = Object.assign({}, dashCache.settings || {}, s);
@@ -6061,9 +6328,16 @@ async function saveSystemSettings() {
       const s2 = await api("/settings/sub2api");
       if (s2 && s2.config) fillSub2apiForm(s2.config);
     } catch (_) {}
+    try {
+      const cpa = await api("/settings/cliproxyapi");
+      if (cpa && cpa.config) fillCliproxyapiForm(cpa.config);
+    } catch (_) {}
     try { await refreshOverviewStatus({ force: true, render: true }); } catch (_) {}
-    if (s2err) {
-      toast("其它设置已保存，但 sub2api 配置失败: " + (s2err.message || s2err), true);
+    if (s2err || cpaErr) {
+      const parts = [];
+      if (s2err) parts.push("sub2api: " + (s2err.message || s2err));
+      if (cpaErr) parts.push("CLIProxyAPI: " + (cpaErr.message || cpaErr));
+      toast("其它设置已保存，但 " + parts.join("；"), true);
     } else {
       toast("设置已保存");
     }

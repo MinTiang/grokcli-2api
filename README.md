@@ -2,14 +2,14 @@
 
 把 **Grok OIDC 登录态** 转成 **OpenAI / Anthropic 兼容 API**，并附带 Web 管理台：多 API Key、多账号轮询、设备码 / SSO / JSON 导入导出、协议注册。
 
-**当前版本：v1.9.90** · 修复 Claude Code tool call could not be parsed · 空 schema 工具补 `{}` · stop_reason 对齐
+**当前版本：v1.9.91** · CLIProxyAPI 号池同步 · 号池统计修正 · 无 SSO 续期失败硬删 · 历史压缩默认关（智商优先）
 
 [![GHCR](https://img.shields.io/badge/ghcr.io-hm2899%2Fgrokcli--2api-blue)](https://github.com/users/HM2899/packages/container/package/grokcli-2api)
 [![Release](https://img.shields.io/github/v/release/HM2899/grokcli-2api?display_name=tag)](https://github.com/HM2899/grokcli-2api/releases)
 
 | 镜像（全小写） | 说明 |
 |----------------|------|
-| `ghcr.io/hm2899/grokcli-2api:1.9.90` | 当前版本 |
+| `ghcr.io/hm2899/grokcli-2api:1.9.91` | 当前版本 |
 | `ghcr.io/hm2899/grokcli-2api:latest` | 最近 `v*` tag |
 | `ghcr.io/hm2899/grokcli-2api:edge` | `main` 最新 |
 
@@ -17,8 +17,8 @@
 - **Hybrid 存储（默认强制）**：PostgreSQL 持久 + Redis 热状态 + 多 Worker
 - **大账号池轮询**：`round_robin` / `least_used` / `random`；**没额度立即冷却踢出**；pick-time inflight 负载分散
 - **会话粘性 / Prompt Cache**：`prompt_cache_key` / Claude session / messages hash；model 隔离绑定；TTL 可热改
-- **协议注册**：内置 `grok-build-auth`（纯 HTTP，无需 Chromium）；**SSO 入库**；可选 **注册成功后自动推 sub2api**
-- **中继友好**：兼容 new-api / sub2api / Claude Code / Codex；`Update`/`StrReplace` → `Edit`；**后到完整参数覆盖错误路径**
+- **协议注册**：内置 `grok-build-auth`（纯 HTTP，无需 Chromium）；**SSO 入库**；可选 **注册成功后自动推 sub2api / CLIProxyAPI**
+- **中继友好**：兼容 new-api / sub2api / CLIProxyAPI / Claude Code / Codex；`Update`/`StrReplace` → `Edit`；**后到完整参数覆盖错误路径**
 - **秒开流 + 可观测**：early SSE 信封；用量明细含 `ttft_ms` / `latency_ms` / **思考强度**；任务日志 + 终态帧
 
 ---
@@ -51,16 +51,16 @@
 | Anthropic 兼容 | `/v1/messages` · tools / tool_use · `count_tokens` |
 | Claude Code 工具 | Grok `Update`/`StrReplace` → 客户端 `Edit`；**后到完整参数覆盖错误路径（含 both-complete）**；`target_file` 等别名归一；残缺编辑不下发 |
 | 注册机 | 批次自愈 + 孤儿回收；全局 inflight；Device Flow 重试；**SSO 入库 + 文件备份**；导出可走账号库；进度卡防连环 toast |
-| 管理台 | 账号、Key、协议注册、测活、续期、任务日志、用量、**系统设置（维护/压缩/探测/sub2api 容量）** |
+| 管理台 | 账号、Key、协议注册、测活、续期、任务日志、用量、**系统设置（维护/压缩/探测/sub2api · CLIProxyAPI）** |
 | 多账号轮询 | `round_robin` / `least_used` / `random`；**pick-time inflight 分散**；可选**出站代理池** |
 | 会话粘性 | `prompt_cache_key` / `previous_response_id` 粘同一账号；**TTL 可热改** |
 | 冷却状态 | **没额度立即冷却踢出**（任意轮询策略）；live 硬排除；仅测活成功 / 手动解除才回池 |
-| Token 过期 / 续期失败 | access token 过期立刻 `pool_status=expired` 移出轮询；连续 2 次 RT 失败 → 有 SSO 则重转，无 SSO 则移出号池 |
-| 号池统计 | 首页冷却 / 过期 / 禁用 **直接数库里 `pool_status` 等账号状态字段** |
+| Token 过期 / 续期失败 | access token 过期立刻 `pool_status=expired` 移出轮询；连续 2 次 RT 失败 → 有 SSO 则重转，**无 SSO 则硬删账号** |
+| 号池统计 | 总量 / 可轮询 / 冷却 / 过期 / 封禁 **互斥分类**（`pool_status` 权威） |
 | Token 续期 | 后台 leader 维护；**维护间隔 / 提前刷新窗口可配置** |
 | 模型探测 | 单账号 / 多选批量 / 全量；**探测模型列表 / 间隔 / 自动踢出可配置** |
 | 协议注册 | MoeMail / YYDS / GPTMail / CF Temp Email + 内联过盾 / YesCaptcha；代理池；入池后延迟测活 |
-| SSO / JSON | 后台任务 + 实时进度；JSON 多文件导入 / 选中导出；**一键推送 sub2api（账号容量/优先级/倍率）** |
+| SSO / JSON / CPA | 后台任务 + 实时进度；JSON 多文件导入；**一键推送 sub2api**；**一键同步 CLIProxyAPI auth 目录**；CPA/auth 文件双向格式兼容 |
 | 任务日志 | 注册、SSO、JSON、测活、续期等结果落 PG |
 | 用量统计 | 代理侧 token / 请求：今日·近 N 天·累计；按 Key / 账号 / 模型；**首字 TTFT / 完成耗时 / 思考强度** |
 | 流式可靠性 | early SSE 信封；**假阳性 client_gone 不再丢中间 tool/text 帧**；错误/断开仍发终态帧 |
@@ -68,18 +68,18 @@
 
 ---
 
-## 本版本重点（v1.9.90）
+## 本版本重点（v1.9.91）
 
 | 能力 | 行为 |
 |------|------|
-| **Claude Code tool 解析** | 修复 `The model's tool call could not be parsed (retry also failed)` |
-| **stop_reason 对齐** | 仅在实际发出 `tool_use` 内容块时返回 `stop_reason=tool_use` |
-| **空 schema 工具** | EnterPlanMode / TaskList / ExitPlanMode 等无参数工具补 `input: {}` |
-| **不完整参数** | 丢弃残缺 tool arguments，不再下发 `{"_raw":...}` 触发 malformed |
-| **流式/非流式一致** | `AnthropicStreamAssembler.finish` 与 `openai_completion_to_anthropic` 同一规则 |
-| **包结构重构** | 业务代码迁入 `grok2api/{admin,pool,protocol,upstream,store}`；根目录 / `store/*` 保留兼容 shim |
+| **CLIProxyAPI 同步** | 设置页配置 CPA Management API；账号页「导入 CLIProxyAPI（选中/全部）」把本地号池推到 CPA auth 目录 |
+| **CPA 文件格式** | 导入识别 `type=xai/codex` 单文件与 `cliproxyapi-auth-bundle`；导出官方 CPA 单账号 JSON 包 |
+| **号池统计修正** | `live/可轮询` 不再把冷却/封禁算进去；分类互斥：enabled · cooldown · model_blocked · expired · disabled |
+| **无 SSO 续期失败** | 连续 2 次 RT 失败且无 SSO：**硬删凭证 + 号池行**（不再假挂在总量里） |
+| **历史压缩默认关** | 默认不压历史（智商优先）；可选软分层压缩作安全阀 |
+| **注册自动推送** | 可选注册成功后自动推 **sub2api** 与/或 **CLIProxyAPI** |
 
-继承 v1.9.89：使用明细思考强度英文标签 · Token 过期移出轮询 · SSO 续期自愈。
+继承 v1.9.90：Claude Code tool 解析修复 · stop_reason 对齐 · `grok2api/` 包布局。
 
 ---
 
@@ -163,7 +163,7 @@ ghcr.io/hm2899/grokcli-2api
 **正确示例：**
 
 ```bash
-docker pull ghcr.io/hm2899/grokcli-2api:1.9.90
+docker pull ghcr.io/hm2899/grokcli-2api:1.9.91
 # 或
 docker pull ghcr.io/hm2899/grokcli-2api:latest
 ```
@@ -202,7 +202,7 @@ services:
       retries: 10
 
   grokcli-2api:
-    image: ghcr.io/hm2899/grokcli-2api:1.9.90
+    image: ghcr.io/hm2899/grokcli-2api:1.9.91
     ports:
       # 只映射应用；不要给 postgres/redis 加 ports
       - "3000:3000"
@@ -451,15 +451,17 @@ docker exec grokcli-2api sh -c 'echo TZ=$TZ; date'
 ```bash
 # 1) grok2api/app.py 中 APP_VERSION 必须与 git tag 一致（镜像路径全小写）
 # 2) 推 main → edge + 版本号；推 v* tag → 额外 latest + GitHub Release
-git add -A && git commit -m "release: v1.9.90"
+git add -A && git commit -m "release: v1.9.91"
 git push origin main
-git tag -a v1.9.90 -m "v1.9.90"
-git push origin v1.9.90
-gh release create v1.9.90 --title "v1.9.90 Claude Code tool parse + package layout" --notes-file - <<'EOF'
+git tag -a v1.9.91 -m "v1.9.91"
+git push origin v1.9.91
+gh release create v1.9.91 --title "v1.9.91 CLIProxyAPI sync + pool stats + hard-delete no-SSO" --notes-file - <<'EOF'
 ## Highlights
-- 修复 Claude Code `tool call could not be parsed`（空 schema 补 `{}`、stop_reason 对齐、丢弃残缺 tool args）
-- 业务代码迁入 `grok2api/` 包；根目录与 `store/*` 保留兼容 shim
-- 继承 v1.9.89：使用明细思考强度英文标签
+- CLIProxyAPI：设置页配置 + 账号页一键同步本地号池到 CPA auth 目录（Management API）
+- CPA 文件格式导入/导出（xai/codex 单文件、cliproxyapi-auth-bundle）
+- 号池统计互斥修正：可轮询 ≠ 总量 − 过期
+- 续不上 AT 且无 SSO：硬删账号
+- 历史压缩默认关闭（智商优先）
 EOF
 # 监视构建
 gh run list --workflow=docker-publish.yml --limit 3
@@ -468,7 +470,7 @@ gh run list --workflow=docker-publish.yml --limit 3
 成功后拉取（**必须小写**）：
 
 ```bash
-docker pull ghcr.io/hm2899/grokcli-2api:1.9.90
+docker pull ghcr.io/hm2899/grokcli-2api:1.9.91
 docker pull ghcr.io/hm2899/grokcli-2api:latest
 ```
 
@@ -490,7 +492,7 @@ grok2api/app.py                          # FastAPI 应用、OpenAI/Anthropic 路
 grok2api/admin/                          # 管理台路由、API Key、设置、任务日志、用量统计
 grok2api/pool/                           # 账号池、认证、配额、模型健康、token 维护、会话粘性
 grok2api/protocol/                       # Claude / Responses / OpenAI 协议兼容与历史压缩
-grok2api/upstream/                       # Grok 上游、OIDC、sub2api、代理、模型目录
+grok2api/upstream/                       # Grok 上游、OIDC、sub2api、CLIProxyAPI、代理、模型目录
 grok2api/store/                          # Redis + PostgreSQL 适配（PG 表、Redis 热状态、锁、指标）
 
 # 兼容层（旧导入仍可用）
@@ -528,7 +530,7 @@ turnstile-solver/                        # 本地过盾（内联）
 
 ## 版本
 
-- **v1.9.90**（当前）
+- **v1.9.91**（当前）
   - 修复 Claude Code 报错 `The model's tool call could not be parsed (retry also failed)`
   - `stop_reason=tool_use` 仅在实际发出 tool_use 内容块时设置（不再仅因 `finish_reason=tool_calls`）
   - 无 required 参数的工具（EnterPlanMode / TaskList / ExitPlanMode 等）空参数补 `input: {}`
@@ -698,7 +700,7 @@ turnstile-solver/                        # 本地过盾（内联）
 - **v1.9.45–1.9.38**：YYDS 域名、任务日志、JSON/SSO 进度、内联 hybrid 等
 - 更早变更见 [GitHub Releases](https://github.com/HM2899/grokcli-2api/releases)
 
-> 镜像 tag 与 `grok2api/app.py` 中 `APP_VERSION` 一致（当前 **1.9.90**）。
+> 镜像 tag 与 `grok2api/app.py` 中 `APP_VERSION` 一致（当前 **1.9.91**）。
 > 拉取路径固定 **`ghcr.io/hm2899/grokcli-2api`**（全小写）。
 
 ## License

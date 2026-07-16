@@ -35,28 +35,47 @@ def _env_int(name: str, default: int, *, minimum: int = 0, maximum: int = 10_000
     return max(minimum, min(maximum, v))
 
 
-# Opt-in only: long CC/sub2api tool loops can enable this to shrink 400–670KB bodies.
-# Default off — compacting tool results can drop context the model still needs.
+# Default OFF — IQ first. Compacting older tool results (even softly) can make
+# the model re-Read, forget paths/errors, and feel dumber. Prefer full history.
+# Enable only when a session is so huge that upstream starts failing / timing out:
+#   GROK2API_HISTORY_COMPACT=1
+# When enabled, soft-tier still prefers head+tail retention over pure placeholders.
 HISTORY_COMPACT_ENABLED = _env_bool("GROK2API_HISTORY_COMPACT", False)
-# Auto-compact when messages JSON exceeds this many chars even if compact is off.
-# Codex / long agent loops otherwise push 100k–150k+ tokens and TTFT explodes.
-# 0 disables the auto threshold.
+# Auto-force compact when messages JSON exceeds this many chars even if the
+# master switch is off. 0 = never auto-force (IQ-first default).
+# Set e.g. 1500000 only if you need a crash-prevention safety net.
 HISTORY_COMPACT_AUTO_CHARS = _env_int(
-    "GROK2API_HISTORY_COMPACT_AUTO_CHARS", 180_000, minimum=0, maximum=5_000_000
+    "GROK2API_HISTORY_COMPACT_AUTO_CHARS", 0, minimum=0, maximum=5_000_000
 )
 # When compacting, keep older rewrites deterministic so multi-turn prompt *prefixes*
 # stay byte-stable across turns (helps upstream automatic prefix cache, same idea
 # as superagent-ai/grok-cli replaying a stable message prefix).
 HISTORY_PREFIX_STABLE = _env_bool("GROK2API_HISTORY_PREFIX_STABLE", True)
-# Keep this many most-recent tool rounds fully (assistant tool_calls + tool results).
-HISTORY_KEEP_TOOL_ROUNDS = _env_int("GROK2API_HISTORY_KEEP_TOOL_ROUNDS", 6, minimum=1, maximum=64)
-# Hard cap per single tool / tool_result content (chars). Recent rounds also truncated.
+# If compact is ON: keep this many most-recent tool rounds nearly fully.
+# IQ-first default is high so only deep history is touched.
+HISTORY_KEEP_TOOL_ROUNDS = _env_int("GROK2API_HISTORY_KEEP_TOOL_ROUNDS", 32, minimum=1, maximum=64)
+# Hard cap per single tool / tool_result content (chars) for *recent* rounds.
+# Head+tail truncation preserves both file start and error/summary tails.
 HISTORY_MAX_TOOL_RESULT_CHARS = _env_int(
-    "GROK2API_HISTORY_MAX_TOOL_RESULT_CHARS", 12_000, minimum=512, maximum=2_000_000
+    "GROK2API_HISTORY_MAX_TOOL_RESULT_CHARS", 48_000, minimum=512, maximum=2_000_000
 )
-# Soft budget for the whole messages array JSON size (chars). Older rounds collapse first.
+# Mid-tier (just outside keep window): keep this many chars head+tail per tool result.
+HISTORY_MID_TOOL_RESULT_CHARS = _env_int(
+    "GROK2API_HISTORY_MID_TOOL_RESULT_CHARS", 16_000, minimum=512, maximum=2_000_000
+)
+# Far-tier (older history): keep this many chars head+tail — enough to remember
+# "which file / which error" without replaying full dumps. Pure placeholder is
+# only used later if still over the messages budget.
+HISTORY_OLD_TOOL_RESULT_CHARS = _env_int(
+    "GROK2API_HISTORY_OLD_TOOL_RESULT_CHARS", 8_000, minimum=256, maximum=2_000_000
+)
+# How many rounds after the keep window still get mid-tier retention (not old-tier).
+HISTORY_MID_TOOL_ROUNDS = _env_int(
+    "GROK2API_HISTORY_MID_TOOL_ROUNDS", 24, minimum=0, maximum=128
+)
+# Soft budget for the whole messages array JSON size (chars). High = more IQ.
 HISTORY_MAX_MESSAGES_CHARS = _env_int(
-    "GROK2API_HISTORY_MAX_MESSAGES_CHARS", 280_000, minimum=8_000, maximum=5_000_000
+    "GROK2API_HISTORY_MAX_MESSAGES_CHARS", 1_200_000, minimum=8_000, maximum=5_000_000
 )
 # Max tools per assistant turn for Claude-compatible paths
 # (/v1/messages, /v1/responses via sub2api). Default 1: sub2api/Claude Code keep
@@ -222,22 +241,58 @@ def _set_text_content(msg: dict[str, Any], text: str) -> None:
 
 
 def _truncate_text(text: str, limit: int, *, label: str = "content") -> str:
-    """Deterministic head truncation (stable for the same text + limit)."""
+    """Deterministic head+tail truncation (stable for the same text + limit).
+
+    Head keeps provenance (paths, imports, command headers); tail keeps the
+    part models usually need most (errors, final output, return values).
+    Pure head-only cuts were dropping those tails and felt like 'IQ loss'.
+    """
     if limit <= 0 or len(text) <= limit:
         return text
-    # Keep a fixed trailer budget so the same (text, limit) always yields the same cut.
-    trailer_budget = 96
-    head = max(0, limit - trailer_budget)
-    omitted = len(text) - head
+    # Fixed trailer so the same (text, limit) always yields the same cut.
+    trailer_budget = 120
+    body = max(0, limit - trailer_budget)
+    if body < 64:
+        # Extremely tight budget: fall back to head-only.
+        head = max(0, limit - 64)
+        omitted = len(text) - head
+        digest = _stable_content_digest(text)
+        return (
+            f"{text[:head]}\n"
+            f"…[{label} truncated, {omitted} chars omitted, id={digest}]"
+        )
+    # Prefer more tail than head: errors / final answers live at the end.
+    head_n = max(32, body // 3)
+    tail_n = max(32, body - head_n)
+    # Avoid overlap on short-ish texts.
+    if head_n + tail_n >= len(text):
+        return text
+    omitted = len(text) - head_n - tail_n
     digest = _stable_content_digest(text)
     return (
-        f"{text[:head]}\n"
-        f"…[{label} truncated, {omitted} chars omitted, id={digest}]"
+        f"{text[:head_n]}\n"
+        f"…[{label} truncated, {omitted} chars omitted, id={digest}]\n"
+        f"{text[-tail_n:]}"
     )
 
 
+def _soft_summary(original: str, *, max_chars: int, reason: str = "older round") -> str:
+    """Head+tail retention for older tool results — keeps IQ better than a pure id.
+
+    Pure placeholders (`[compacted…]`) erase paths/errors the model still needs.
+    Soft summary keeps a deterministic slice of the original so re-Read is a
+    last resort, not the default.
+    """
+    text = original or ""
+    n = len(text)
+    if n <= max_chars:
+        return text
+    # Reuse head+tail trunc; label carries the reason for humans/debug.
+    return _truncate_text(text, max_chars, label=f"tool_result/{reason}")
+
+
 def _placeholder(original: str, *, reason: str = "older round") -> str:
-    """Deterministic placeholder: same original → same rewrite across turns."""
+    """Deterministic pure placeholder — last-resort only when over hard budget."""
     text = original or ""
     n = len(text)
     digest = _stable_content_digest(text)
@@ -248,7 +303,17 @@ def _placeholder(original: str, *, reason: str = "older round") -> str:
 
 
 def _already_compacted(text: str) -> bool:
-    return bool(text) and text.startswith(_PLACEHOLDER_PREFIX)
+    if not text:
+        return False
+    if text.startswith(_PLACEHOLDER_PREFIX):
+        return True
+    # Soft summaries / truncations also count as already-rewritten so we do not
+    # re-mutate them on later turns (prefix stability).
+    if "…[tool_result" in text or "…[content truncated" in text:
+        return True
+    if " chars omitted, id=" in text:
+        return True
+    return False
 
 
 def _messages_char_size(messages: list[Any]) -> int:
@@ -310,11 +375,18 @@ def _shrink_tool_message(
     max_chars: int,
     force_placeholder: bool,
     prefix_stable: bool = True,
+    soft_summary: bool = False,
+    reason: str = "older round",
 ) -> bool:
     """Mutate one tool message. Returns True if content changed.
 
-    When ``prefix_stable`` is on, already-compacted placeholders are left alone
-    and rewrites depend only on original text (not turn index / remaining budget).
+    Modes:
+      - force_placeholder + soft_summary: head+tail soft summary (preferred for IQ)
+      - force_placeholder + not soft_summary: pure id placeholder (last-resort)
+      - not force: head+tail truncate to max_chars (recent / mid rounds)
+
+    When ``prefix_stable`` is on, already-rewritten messages are left alone so
+    multi-turn prompt prefixes stay byte-stable.
     """
     original = _content_to_text(msg.get("content"))
     if not original:
@@ -322,7 +394,10 @@ def _shrink_tool_message(
     if prefix_stable and _already_compacted(original):
         return False
     if force_placeholder:
-        new = _placeholder(original, reason="older round")
+        if soft_summary and max_chars > 0:
+            new = _soft_summary(original, max_chars=max_chars, reason=reason)
+        else:
+            new = _placeholder(original, reason=reason)
         if new != original:
             _set_text_content(msg, new)
             return True
@@ -362,15 +437,23 @@ def compact_openai_messages(
     max_tool_result_chars: int | None = None,
     max_messages_chars: int | None = None,
     prefix_stable: bool | None = None,
+    mid_tool_rounds: int | None = None,
+    mid_tool_result_chars: int | None = None,
+    old_tool_result_chars: int | None = None,
 ) -> tuple[list[Any], dict[str, Any]]:
-    """Compact OpenAI-style messages in place-safe copy.
+    """Compact OpenAI-style messages in a copy (never mutates caller).
 
-    Returns (messages, stats). Stats always present for response headers / logs.
+    Soft-tier strategy (protect model IQ):
+      1. Recent ``keep_tool_rounds``: full content, only head+tail-truncate if a
+         single result exceeds ``max_tool_result_chars``.
+      2. Mid window (next ``mid_tool_rounds``): head+tail soft summary at
+         ``mid_tool_result_chars`` — keeps paths/errors, drops bulk dumps.
+      3. Older rounds: head+tail soft summary at ``old_tool_result_chars``.
+      4. Only if still over ``max_messages_chars`` budget: further shrink mid/old
+         then, as a last resort, pure ``[compacted…]`` placeholders (oldest first).
 
-    Prefix stability (default on): older tool results are rewritten with a
-    deterministic placeholder/truncation that depends only on the original
-    content. Once compacted, content is not re-mutated on later turns, so the
-    prompt *prefix* stays byte-stable for automatic upstream cache hits.
+    Never strips tool_calls. Prefix-stable mode leaves already-rewritten content
+    alone so multi-turn prompt prefixes stay byte-stable.
     """
     stats: dict[str, Any] = {
         "enabled": False,
@@ -378,9 +461,13 @@ def compact_openai_messages(
         "before_chars": 0,
         "after_chars": 0,
         "tool_rounds": 0,
-        "compacted_tool_msgs": 0,
-        "truncated_tool_msgs": 0,
+        "compacted_tool_msgs": 0,  # pure placeholders (last-resort)
+        "truncated_tool_msgs": 0,  # head+tail / soft summary
+        "soft_summary_msgs": 0,
         "prefix_stable": False,
+        "keep_tool_rounds": 0,
+        "mid_tool_rounds": 0,
+        "policy": "soft-tier",
     }
     if not isinstance(messages, list) or not messages:
         return messages or [], stats
@@ -396,9 +483,23 @@ def compact_openai_messages(
         HISTORY_MAX_MESSAGES_CHARS if max_messages_chars is None else max_messages_chars
     )
     stable = HISTORY_PREFIX_STABLE if prefix_stable is None else bool(prefix_stable)
+    mid_n = HISTORY_MID_TOOL_ROUNDS if mid_tool_rounds is None else mid_tool_rounds
+    mid_chars = (
+        HISTORY_MID_TOOL_RESULT_CHARS
+        if mid_tool_result_chars is None
+        else mid_tool_result_chars
+    )
+    old_chars = (
+        HISTORY_OLD_TOOL_RESULT_CHARS
+        if old_tool_result_chars is None
+        else old_tool_result_chars
+    )
     keep = max(1, int(keep))
     max_tr = max(512, int(max_tr))
     budget = max(8_000, int(budget))
+    mid_n = max(0, int(mid_n))
+    mid_chars = max(256, int(mid_chars))
+    old_chars = max(128, int(old_chars))
 
     # Shallow-copy messages + dicts so we never mutate caller's request objects.
     out: list[Any] = []
@@ -412,12 +513,14 @@ def compact_openai_messages(
     stats["before_chars"] = before
     stats["enabled"] = bool(use)
     stats["prefix_stable"] = bool(stable)
+    stats["keep_tool_rounds"] = int(keep)
+    stats["mid_tool_rounds"] = int(mid_n)
 
     if not use:
         stats["after_chars"] = before
         return out, stats
 
-    # Compute spans on full `out` so indices match (non-dict entries are skipped).
+    # Tool-round spans: (assistant tool_calls … following tool msgs).
     spans: list[tuple[int, int]] = []
     i = 0
     n = len(out)
@@ -433,50 +536,130 @@ def compact_openai_messages(
             i += 1
     stats["tool_rounds"] = len(spans)
 
-    protected: set[int] = set()
-    for start, end in spans[-keep:]:
-        for idx in range(start, end):
-            protected.add(idx)
+    recent_spans = spans[-keep:] if keep else []
+    rest = spans[:-keep] if keep else list(spans)
+    mid_spans = rest[-mid_n:] if mid_n else []
+    old_spans = rest[:-mid_n] if mid_n else rest
 
-    # Pass 1 (always): placeholder older tool rounds; clamp recent oversized results.
-    # Do this even when under budget so long sessions don't slowly accumulate.
-    # Deterministic rewrites keep older prefix stable across successive turns.
-    for start, end in spans:
-        recent = any(idx in protected for idx in range(start, end))
+    recent_idx: set[int] = set()
+    for start, end in recent_spans:
+        recent_idx.update(range(start, end))
+
+    # Pass 1 — tiered soft shrink (never pure placeholder here).
+    for start, end in recent_spans:
         for idx in range(start, end):
             m = out[idx]
             if not isinstance(m, dict) or not _is_tool_message(m):
                 continue
-            if recent:
-                if _shrink_tool_message(
-                    m,
-                    max_chars=max_tr,
-                    force_placeholder=False,
-                    prefix_stable=stable,
-                ):
-                    stats["truncated_tool_msgs"] += 1
-            else:
-                if _shrink_tool_message(
-                    m,
-                    max_chars=max_tr,
-                    force_placeholder=True,
-                    prefix_stable=stable,
-                ):
-                    stats["compacted_tool_msgs"] += 1
+            if _shrink_tool_message(
+                m,
+                max_chars=max_tr,
+                force_placeholder=False,
+                prefix_stable=stable,
+            ):
+                stats["truncated_tool_msgs"] += 1
 
-    # Pass 2: if still over budget, hard-clamp recent tool results further.
-    # Only the *recent protected* window may shrink further — older placeholders
-    # stay fixed so the multi-turn prefix does not keep changing.
+    for start, end in mid_spans:
+        for idx in range(start, end):
+            m = out[idx]
+            if not isinstance(m, dict) or not _is_tool_message(m):
+                continue
+            if _shrink_tool_message(
+                m,
+                max_chars=mid_chars,
+                force_placeholder=True,
+                prefix_stable=stable,
+                soft_summary=True,
+                reason="mid round",
+            ):
+                stats["soft_summary_msgs"] += 1
+                stats["truncated_tool_msgs"] += 1
+
+    for start, end in old_spans:
+        for idx in range(start, end):
+            m = out[idx]
+            if not isinstance(m, dict) or not _is_tool_message(m):
+                continue
+            if _shrink_tool_message(
+                m,
+                max_chars=old_chars,
+                force_placeholder=True,
+                prefix_stable=stable,
+                soft_summary=True,
+                reason="older round",
+            ):
+                stats["soft_summary_msgs"] += 1
+                stats["truncated_tool_msgs"] += 1
+
+    # Pass 2 — still over budget: tighten mid/old soft summaries further.
     after = _messages_char_size(out)
     if after > budget:
-        hard = max(1_500, max_tr // 3)
-        for start, end in reversed(spans[-keep:]):
+        tighter_old = max(512, old_chars // 2)
+        tighter_mid = max(1024, mid_chars // 2)
+        for tier_spans, cap, reason in (
+            (old_spans, tighter_old, "budget/old"),
+            (mid_spans, tighter_mid, "budget/mid"),
+        ):
+            if after <= budget:
+                break
+            for start, end in tier_spans:
+                if after <= budget:
+                    break
+                for idx in range(start, end):
+                    m = out[idx]
+                    if not isinstance(m, dict) or not _is_tool_message(m):
+                        continue
+                    text = _content_to_text(m.get("content"))
+                    # Allow re-tighten only when content is still large and not a pure placeholder.
+                    if not text or text.startswith(_PLACEHOLDER_PREFIX):
+                        continue
+                    if len(text) <= cap:
+                        continue
+                    # Bypass prefix_stable skip for already-soft-summarized large blobs
+                    # only when over budget — but keep rewrite deterministic on original
+                    # is impossible once rewritten; re-truncate the current text stably.
+                    new = _truncate_text(text, cap, label=f"tool_result/{reason}")
+                    if new != text:
+                        _set_text_content(m, new)
+                        stats["truncated_tool_msgs"] += 1
+                after = _messages_char_size(out)
+
+    # Pass 3 — last resort: pure placeholders on oldest soft-summaries (oldest first).
+    after = _messages_char_size(out)
+    if after > budget:
+        for start, end in old_spans + mid_spans:
+            if after <= budget:
+                break
+            for idx in range(start, end):
+                if after <= budget:
+                    break
+                m = out[idx]
+                if not isinstance(m, dict) or not _is_tool_message(m):
+                    continue
+                text = _content_to_text(m.get("content"))
+                if not text or text.startswith(_PLACEHOLDER_PREFIX):
+                    continue
+                # Convert soft summary / remaining text into pure placeholder.
+                # Use current text for digest so rewrite is deterministic on current bytes.
+                new = _placeholder(text, reason="size budget")
+                if new != text:
+                    _set_text_content(m, new)
+                    stats["compacted_tool_msgs"] += 1
+                    after = _messages_char_size(out)
+
+    # Pass 4 — still over: hard-clamp recent tool results (never drop tool_calls).
+    after = _messages_char_size(out)
+    if after > budget:
+        hard = max(2_000, max_tr // 3)
+        for start, end in reversed(recent_spans):
+            if after <= budget:
+                break
             for idx in range(start, end):
                 m = out[idx]
                 if not isinstance(m, dict) or not _is_tool_message(m):
                     continue
                 text = _content_to_text(m.get("content"))
-                if _already_compacted(text):
+                if not text or text.startswith(_PLACEHOLDER_PREFIX):
                     continue
                 if len(text) > hard:
                     new = _truncate_text(text, hard, label="tool_result")
@@ -484,11 +667,8 @@ def compact_openai_messages(
                         _set_text_content(m, new)
                         stats["truncated_tool_msgs"] += 1
             after = _messages_char_size(out)
-            if after <= budget:
-                break
 
-    # Pass 3: still over budget — truncate older user/assistant prose (not system).
-    # Skip already-compacted tool msgs; never touch system (cache-critical prefix).
+    # Pass 5 — still over: trim huge user/assistant prose (never system).
     after = _messages_char_size(out)
     if after > budget:
         soft = max(2_000, max_tr // 2)
@@ -500,20 +680,12 @@ def compact_openai_messages(
             role = (m.get("role") or "").lower()
             if role == "system":
                 continue
-            if idx in protected:
+            if idx in recent_idx:
                 continue
             if _is_tool_message(m):
-                text = _content_to_text(m.get("content"))
-                if not _already_compacted(text):
-                    _set_text_content(m, _placeholder(text, reason="size budget"))
-                    stats["compacted_tool_msgs"] += 1
-                    after = _messages_char_size(out)
                 continue
             if role in ("user", "assistant"):
-                # Prefix-stable mode: only shrink very large tails; avoid re-writing
-                # mid-history prose that already sits inside the stable prefix.
                 if stable and idx < max(0, len(out) - keep * 4):
-                    # Leave early non-tool turns alone once they are moderate size.
                     text = _content_to_text(m.get("content"))
                     if len(text) <= soft * 2:
                         continue
@@ -532,6 +704,7 @@ def compact_openai_messages(
     stats["applied"] = (
         stats["compacted_tool_msgs"] > 0
         or stats["truncated_tool_msgs"] > 0
+        or stats["soft_summary_msgs"] > 0
         or after < before
     )
     return out, stats

@@ -101,6 +101,8 @@ _PG_SCALAR_KEYS = (
     "outbound_proxy_config",
     # sub2api push (URL / login / default group)
     "sub2api_config",
+    # CLIProxyAPI push (management API)
+    "cliproxyapi_config",
 )
 
 
@@ -1282,13 +1284,13 @@ def get_history_compact_auto_chars() -> int:
         try:
             import grok2api.protocol.history_compact as hc
 
-            return int(getattr(hc, "HISTORY_COMPACT_AUTO_CHARS", 180_000) or 0)
+            return int(getattr(hc, "HISTORY_COMPACT_AUTO_CHARS", 0) or 0)
         except Exception:
-            return 180_000
+            return 0  # IQ-first: no auto-force
     try:
         v = int(raw)
     except (TypeError, ValueError):
-        v = 180_000
+        v = 0
     # 0 = off; otherwise clamp to a sane band
     if v <= 0:
         return 0
@@ -1323,13 +1325,13 @@ def get_history_keep_tool_rounds() -> int:
         try:
             import grok2api.protocol.history_compact as hc
 
-            return int(getattr(hc, "HISTORY_KEEP_TOOL_ROUNDS", 6) or 6)
+            return int(getattr(hc, "HISTORY_KEEP_TOOL_ROUNDS", 32) or 32)
         except Exception:
-            return 6
+            return 32
     try:
         v = int(raw)
     except (TypeError, ValueError):
-        v = 6
+        v = 32
     return max(1, min(64, v))
 
 
@@ -1366,13 +1368,13 @@ def get_history_max_tool_result_chars() -> int:
         try:
             import grok2api.protocol.history_compact as hc
 
-            return int(getattr(hc, "HISTORY_MAX_TOOL_RESULT_CHARS", 12_000) or 12_000)
+            return int(getattr(hc, "HISTORY_MAX_TOOL_RESULT_CHARS", 48_000) or 48_000)
         except Exception:
-            return 12_000
+            return 48_000
     try:
         v = int(raw)
     except (TypeError, ValueError):
-        v = 12_000
+        v = 48_000
     return max(512, min(2_000_000, v))
 
 
@@ -3265,6 +3267,13 @@ def update_runtime_settings(patch: dict[str, Any]) -> dict[str, Any]:
             set_sub2api_config(patch["sub2api_config"], replace=False)
         except Exception as e:  # noqa: BLE001
             raise ValueError(f"sub2api_config: {e}") from e
+    if "cliproxyapi_config" in patch and patch["cliproxyapi_config"] is not None:
+        try:
+            from grok2api.upstream.cliproxyapi_client import set_cliproxyapi_config
+
+            set_cliproxyapi_config(patch["cliproxyapi_config"], replace=False)
+        except Exception as e:  # noqa: BLE001
+            raise ValueError(f"cliproxyapi_config: {e}") from e
     # Outbound proxy pool (flat fields or nested outbound_proxy / outbound_proxy_config)
     ob_patch: dict[str, Any] = {}
     for nested_key in ("outbound_proxy_config", "outbound_proxy"):
@@ -3314,6 +3323,15 @@ def get_public_settings() -> dict[str, Any]:
         sub2api_pub = public_sub2api_config()
     except Exception:
         sub2api_pub = {"enabled": False, "base_url": "", "email": "", "has_password": False}
+    try:
+        from grok2api.upstream.cliproxyapi_client import public_cliproxyapi_config
+        cliproxyapi_pub = public_cliproxyapi_config()
+    except Exception:
+        cliproxyapi_pub = {
+            "enabled": False,
+            "base_url": "",
+            "has_management_key": False,
+        }
     pool_policy = get_pool_policy()
 
     return {
@@ -3356,5 +3374,6 @@ def get_public_settings() -> dict[str, Any]:
         "outbound_proxy_config": outbound,
         "outbound_proxy_pool": outbound_summary,
         "sub2api_config": sub2api_pub,
+        "cliproxyapi_config": cliproxyapi_pub,
         "updated_at": data.get("updated_at"),
     }
