@@ -12,36 +12,53 @@ import (
 
 type AccountList struct {
 	Accounts   []map[string]any `json:"accounts"`
+	IDs        []string         `json:"ids,omitempty"`
 	Total      int64            `json:"total"`
 	Page       int              `json:"page"`
 	PageSize   int              `json:"page_size"`
 	TotalPages int              `json:"total_pages"`
 	Query      string           `json:"q"`
 	Sort       string           `json:"sort"`
+	Status     string           `json:"status,omitempty"`
+	HasSSO     *bool            `json:"has_sso,omitempty"`
+}
+
+// AccountListFilter controls server-side account list filters.
+type AccountListFilter struct {
+	Query   string
+	Sort    string
+	Status  string // "", live, cooldown, disabled, quota_disabled, model_blocked, expired, normal
+	HasSSO  *bool
+	IDsOnly bool // when true, return only matching ids (for "筛选全选")
 }
 
 func (c *Connector) ListAccountSummaries(ctx context.Context, page, pageSize int, query, sort string) (AccountList, error) {
-	sort = normalizeAccountSort(sort)
+	return c.ListAccountSummariesFiltered(ctx, page, pageSize, AccountListFilter{Query: query, Sort: sort})
+}
+
+func (c *Connector) ListAccountSummariesFiltered(ctx context.Context, page, pageSize int, filter AccountListFilter) (AccountList, error) {
+	sort := normalizeAccountSort(filter.Sort)
 	orderBy := accountOrderSQL(sort)
-	query = strings.TrimSpace(strings.ToLower(query))
+	query := strings.TrimSpace(strings.ToLower(filter.Query))
+	status := normalizeAccountStatusFilter(filter.Status)
 	if page < 1 {
 		page = 1
 	}
 	if pageSize <= 0 || pageSize >= 10000 {
 		pageSize = 0
-	} else if pageSize > 200 {
+	} else if pageSize > 200 && !filter.IDsOnly {
 		pageSize = 200
 	}
-
-	where := ""
-	args := []any{}
-	if query != "" {
-		where = "WHERE lower(COALESCE(email,'')) LIKE $1 OR lower(id) LIKE $1 OR lower(COALESCE(user_id,'')) LIKE $1"
-		args = append(args, "%"+query+"%")
+	// IDs-only selection may need a larger page; hard-cap to protect memory.
+	if filter.IDsOnly && (pageSize <= 0 || pageSize > 20000) {
+		pageSize = 20000
 	}
 
+	where, args := buildAccountListWhere(query, status, filter.HasSSO)
+
 	var total int64
-	if err := c.Pool.QueryRow(ctx, "SELECT COUNT(*) FROM accounts "+where, args...).Scan(&total); err != nil {
+	countSQL := "SELECT COUNT(*) FROM accounts a LEFT JOIN account_pool ap ON ap.account_id = a.id " + where
+	if err := c.Pool.QueryRow(ctx, countSQL, args...).Scan(&total); err != nil {
 		return AccountList{}, err
 	}
 	limitClause := ""
@@ -208,7 +225,133 @@ func (c *Connector) ListAccountSummaries(ctx context.Context, page, pageSize int
 	if err := rows.Err(); err != nil {
 		return AccountList{}, err
 	}
-	return AccountList{Accounts: accounts, Total: total, Page: pageOut, PageSize: pageSizeOut, TotalPages: totalPages, Query: query, Sort: sort}, nil
+	out := AccountList{
+		Accounts: accounts, Total: total, Page: pageOut, PageSize: pageSizeOut,
+		TotalPages: totalPages, Query: query, Sort: sort, Status: status, HasSSO: filter.HasSSO,
+	}
+	if filter.IDsOnly {
+		ids := make([]string, 0, len(accounts))
+		for _, a := range accounts {
+			if id, _ := a["id"].(string); id != "" {
+				ids = append(ids, id)
+			}
+		}
+		out.IDs = ids
+		// Keep lightweight rows optional; UI primarily uses ids.
+	}
+	return out, nil
+}
+
+func normalizeAccountStatusFilter(status string) string {
+	s := strings.ToLower(strings.TrimSpace(status))
+	switch s {
+	case "", "all", "*":
+		return ""
+	case "live", "ok", "active", "polling":
+		return "live"
+	case "normal":
+		return "normal"
+	case "cooldown", "cooling":
+		return "cooldown"
+	case "disabled", "disable":
+		return "disabled"
+	case "quota", "quota_disabled", "quota-disabled":
+		return "quota_disabled"
+	case "model_blocked", "model-blocked", "blocked":
+		return "model_blocked"
+	case "expired", "expire":
+		return "expired"
+	default:
+		return s
+	}
+}
+
+// buildAccountListWhere builds WHERE for accounts a LEFT JOIN account_pool ap.
+// Status filters mirror derivePoolStatus used by the UI.
+func buildAccountListWhere(query, status string, hasSSO *bool) (string, []any) {
+	clauses := make([]string, 0, 4)
+	args := make([]any, 0, 8)
+	next := 1
+	add := func(sqlFrag string, vals ...any) {
+		// sqlFrag uses ? placeholders
+		var b strings.Builder
+		vi := 0
+		for i := 0; i < len(sqlFrag); i++ {
+			if sqlFrag[i] == '?' {
+				b.WriteByte('$')
+				b.WriteString(strconv.Itoa(next))
+				next++
+				vi++
+				continue
+			}
+			b.WriteByte(sqlFrag[i])
+		}
+		if vi != len(vals) {
+			// still append; caller bug would surface as query error
+		}
+		clauses = append(clauses, b.String())
+		args = append(args, vals...)
+	}
+
+	if query != "" {
+		like := "%" + query + "%"
+		add("(lower(COALESCE(a.email,'')) LIKE ? OR lower(a.id) LIKE ? OR lower(COALESCE(a.user_id,'')) LIKE ?)", like, like, like)
+	}
+	if hasSSO != nil {
+		ssoExpr := `(
+			NULLIF(trim(COALESCE(a.payload->>'sso','')), '') IS NOT NULL OR
+			NULLIF(trim(COALESCE(a.payload->>'sso_cookie','')), '') IS NOT NULL OR
+			NULLIF(trim(COALESCE(a.payload->>'sso_token','')), '') IS NOT NULL OR
+			NULLIF(trim(COALESCE(a.payload->>'cookie','')), '') IS NOT NULL OR
+			NULLIF(trim(COALESCE(a.payload->>'cookies','')), '') IS NOT NULL OR
+			(a.payload ? 'sso') OR (a.payload ? 'sso_cookie')
+		)`
+		// payload ? key uses ? which conflicts with placeholder — escape by not using add()
+		// Build absolute fragment manually.
+		if *hasSSO {
+			clauses = append(clauses, ssoExpr)
+		} else {
+			clauses = append(clauses, "NOT "+ssoExpr)
+		}
+	}
+	if status != "" {
+		expiredExpr := `((a.expires_at IS NOT NULL AND a.expires_at <= now()) OR COALESCE(ap.pool_status,'') = 'expired')`
+		quotaExpr := `(COALESCE(ap.disabled_for_quota, false) = true OR COALESCE(ap.pool_status,'') = 'quota_disabled')`
+		disabledExpr := `(COALESCE(ap.enabled, true) = false OR COALESCE(ap.pool_status,'') = 'disabled')`
+		cooldownExpr := `((ap.cooldown_until IS NOT NULL AND ap.cooldown_until > now()) OR COALESCE(ap.cooldown_count,0) > 0 OR COALESCE(ap.pool_status,'') = 'cooldown')`
+		modelBlockExpr := `((COALESCE(ap.blocked_models, '{}'::jsonb) <> '{}'::jsonb AND COALESCE(ap.blocked_models, '{}'::jsonb) <> 'null'::jsonb) OR COALESCE(ap.pool_status,'') = 'model_blocked')`
+		liveExpr := `(COALESCE(ap.enabled, true) = true
+			AND COALESCE(ap.disabled_for_quota, false) = false
+			AND NOT ` + expiredExpr + `
+			AND NOT ` + cooldownExpr + `
+			AND NOT ` + modelBlockExpr + `
+			AND COALESCE(ap.pool_status,'normal') NOT IN ('expired','disabled','quota_disabled','cooldown','model_blocked'))`
+		switch status {
+		case "live":
+			clauses = append(clauses, liveExpr)
+		case "normal":
+			clauses = append(clauses, `(COALESCE(ap.enabled, true) = true
+				AND COALESCE(ap.disabled_for_quota, false) = false
+				AND NOT `+cooldownExpr+`
+				AND NOT `+expiredExpr+`
+				AND NOT `+modelBlockExpr+`
+				AND COALESCE(ap.pool_status,'normal') = 'normal')`)
+		case "cooldown":
+			clauses = append(clauses, `(NOT `+expiredExpr+` AND NOT `+quotaExpr+` AND COALESCE(ap.enabled, true) = true AND `+cooldownExpr+`)`)
+		case "disabled":
+			clauses = append(clauses, `(NOT `+quotaExpr+` AND `+disabledExpr+`)`)
+		case "quota_disabled":
+			clauses = append(clauses, quotaExpr)
+		case "model_blocked":
+			clauses = append(clauses, `(NOT `+expiredExpr+` AND NOT `+quotaExpr+` AND COALESCE(ap.enabled, true) = true AND NOT `+cooldownExpr+` AND `+modelBlockExpr+`)`)
+		case "expired":
+			clauses = append(clauses, expiredExpr)
+		}
+	}
+	if len(clauses) == 0 {
+		return "", nil
+	}
+	return "WHERE " + strings.Join(clauses, " AND "), args
 }
 
 func normalizeAccountSort(sort string) string {

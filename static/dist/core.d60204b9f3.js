@@ -53,6 +53,7 @@ window.G2A = window.G2A || {};
   let accountsSort = "newest";
   // "" | "1" | "0" — server-side has_sso filter
   let accountsSsoFilter = "";
+  let accountsStatusFilter = "";
   let selectedAccountIds = new Set();
   function syncToken() { token = (window.G2A && G2A.getToken) ? G2A.getToken() : token; }
   function headers(json = true) {
@@ -651,6 +652,25 @@ function rebindPageControls() {
       loadAccountsPage({ reset: true });
     };
   }
+  if ($("acc-filter-status")) {
+    try {
+      const savedStatus = localStorage.getItem("g2a_accounts_status_filter");
+      if (savedStatus != null) {
+        accountsStatusFilter = savedStatus || "";
+        $("acc-filter-status").value = accountsStatusFilter;
+      } else {
+        accountsStatusFilter = $("acc-filter-status").value || "";
+      }
+    } catch (_) {
+      accountsStatusFilter = $("acc-filter-status").value || "";
+    }
+    $("acc-filter-status").onchange = () => {
+      accountsStatusFilter = ($("acc-filter-status").value || "");
+      try { localStorage.setItem("g2a_accounts_status_filter", accountsStatusFilter); } catch (_) {}
+      try { renderAccountStatusChips(); } catch (_) {}
+      loadAccountsPage({ reset: true });
+    };
+  }
   if ($("acc-filter-sso")) {
     try {
       const savedSso = localStorage.getItem("g2a_accounts_sso_filter");
@@ -671,7 +691,7 @@ function rebindPageControls() {
     };
   }
   if ($("btn-acc-select-page")) $("btn-acc-select-page").onclick = () => setPageSelection(true);
-  if ($("btn-acc-select-all-filtered")) $("btn-acc-select-all-filtered").onclick = () => { setPageSelection(true); toast("已选择本页账号（服务端分页）"); };
+  if ($("btn-acc-select-all-filtered")) $("btn-acc-select-all-filtered").onclick = () => { selectAllFilteredAccounts(); };
   if ($("btn-acc-select-none")) $("btn-acc-select-none").onclick = () => { selectedAccountIds.clear(); renderAccountsPage(); };
   if ($("btn-acc-delete-selected")) $("btn-acc-delete-selected").onclick = () => deleteSelectedAccounts();
   if ($("btn-acc-renew-selected")) $("btn-acc-renew-selected").onclick = () => renewAccounts(Array.from(selectedAccountIds));
@@ -1291,6 +1311,67 @@ function fmtQuotaCell(p, liveQuota) {
 }
 
 
+function accountStatusFilterLabel(key) {
+  const hit = ACCOUNT_STATUS_FILTERS.find((x) => x.key === (key || ""));
+  return hit ? hit.label : (key || "");
+}
+
+function setAccountStatusFilter(key, { reload = true }
+
+function renderAccountStatusChips() {
+  const el = $("acc-status-chips");
+  if (!el) return;
+  const cur = accountsStatusFilter || "";
+  el.innerHTML = ACCOUNT_STATUS_FILTERS.map((s) => {
+    const active = (s.key || "") === cur;
+    const cls = ["g2a-btn", "g2a-btn-sm", active ? "g2a-btn-primary" : "g2a-btn-default"].join(" ");
+    const title = s.key
+      ? `只显示「${s.label}」账号；点「筛选全选」可选中该状态下全部账号`
+      : "显示全部状态";
+    return `<button type="button" class="${cls}" data-acc-status="${esc(s.key)}" title="${esc(title)}">${esc(s.label)}</button>`;
+  }).join("");
+  el.querySelectorAll("[data-acc-status]").forEach((btn) => {
+    btn.onclick = () => setAccountStatusFilter(btn.getAttribute("data-acc-status") || "");
+  });
+}
+
+async function selectAllFilteredAccounts() {
+  const btn = $("btn-acc-select-all-filtered");
+  const q = (accountsSearchQuery || ($("acc-search") && $("acc-search").value) || "").trim();
+  const sort = accountsSort || "newest";
+  const ssoQs = (accountsSsoFilter === "1" || accountsSsoFilter === "0")
+    ? `&has_sso=${encodeURIComponent(accountsSsoFilter === "1" ? "true" : "false")}`
+    : "";
+  const statusQs = accountsStatusFilter
+    ? `&status=${encodeURIComponent(accountsStatusFilter)}`
+    : "";
+  if (btn) {
+    btn.disabled = true;
+    if (!btn.dataset.label) btn.dataset.label = btn.textContent;
+    btn.textContent = "选择中…";
+  }
+  try {
+    const data = await api(
+      `/accounts?page=1&page_size=20000&ids_only=1` +
+      `&q=${encodeURIComponent(q)}&sort=${encodeURIComponent(sort)}${ssoQs}${statusQs}`
+    );
+    const ids = Array.isArray(data.ids) && data.ids.length
+      ? data.ids
+      : (Array.isArray(data.accounts) ? data.accounts.map((a) => a && a.id).filter(Boolean) : []);
+    selectedAccountIds = new Set(ids.map(String));
+    try { renderAccountsPage(); } catch (_) {}
+    const st = accountStatusFilterLabel(accountsStatusFilter);
+    toast(`已选中筛选结果 ${selectedAccountIds.size} 个` + (st && st !== "全部" ? `（${st}）` : ""));
+  } catch (e) {
+    toast(e.message || "筛选全选失败", false);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = btn.dataset.label || "筛选全选";
+    }
+  }
+}
+
 function getFilteredAccounts() {
   // Server-side filtering/pagination: accountsList holds current page rows.
   return accountsList.slice();
@@ -1415,16 +1496,20 @@ async function loadAccountsPage({ reset = false } = {}) {
   accountsSearchQuery = q;
   if ($("acc-sort") && $("acc-sort").value) accountsSort = $("acc-sort").value;
   if ($("acc-filter-sso")) accountsSsoFilter = $("acc-filter-sso").value || "";
+  if ($("acc-filter-status")) accountsStatusFilter = $("acc-filter-status").value || accountsStatusFilter || "";
   const sort = accountsSort || "newest";
   const pageSize = accountsPageSize || 25;
   const page = accountsPage || 1;
   const ssoQs = (accountsSsoFilter === "1" || accountsSsoFilter === "0")
     ? `&has_sso=${encodeURIComponent(accountsSsoFilter === "1" ? "true" : "false")}`
     : "";
+  const statusQs = accountsStatusFilter
+    ? `&status=${encodeURIComponent(accountsStatusFilter)}`
+    : "";
   try {
     const data = await api(
       `/accounts?page=${encodeURIComponent(page)}&page_size=${encodeURIComponent(pageSize)}` +
-      `&q=${encodeURIComponent(q)}&sort=${encodeURIComponent(sort)}${ssoQs}`
+      `&q=${encodeURIComponent(q)}&sort=${encodeURIComponent(sort)}${ssoQs}${statusQs}`
     );
     if (seq !== accountsLoadSeq) return;
     const rawAccounts = Array.isArray(data && data.accounts) ? data.accounts : [];
@@ -1944,7 +2029,7 @@ if ($("acc-search")) {
   });
 }
 if ($("btn-acc-select-page")) $("btn-acc-select-page").onclick = () => setPageSelection(true);
-if ($("btn-acc-select-all-filtered")) $("btn-acc-select-all-filtered").onclick = () => { setPageSelection(true); toast("已选择本页账号（服务端分页）"); };
+if ($("btn-acc-select-all-filtered")) $("btn-acc-select-all-filtered").onclick = () => { selectAllFilteredAccounts(); };
 if ($("btn-acc-select-none")) $("btn-acc-select-none").onclick = () => {
   selectedAccountIds.clear();
   renderAccountsPage();

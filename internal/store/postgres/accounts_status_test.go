@@ -1,6 +1,7 @@
 package postgres
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -44,4 +45,31 @@ func TestActiveBlockedModelsExpires(t *testing.T) {
 	if _, ok := out["perm"]; !ok {
 		t.Fatalf("permanent block missing: %#v", out)
 	}
+}
+
+func TestBuildAccountListWhereStatus(t *testing.T) {
+	where, args := buildAccountListWhere("", "cooldown", nil)
+	if where == "" || !containsFold(where, "cooldown") {
+		t.Fatalf("cooldown where=%q args=%v", where, args)
+	}
+	where, args = buildAccountListWhere("foo", "disabled", nil)
+	if len(args) != 3 {
+		t.Fatalf("query args=%v", args)
+	}
+	if !containsFold(where, "enabled") {
+		t.Fatalf("disabled where=%q", where)
+	}
+	trueVal := true
+	where, args = buildAccountListWhere("", "live", &trueVal)
+	if where == "" || !containsFold(where, "sso") {
+		t.Fatalf("live+sso where=%q", where)
+	}
+	where, _ = buildAccountListWhere("", "model_blocked", nil)
+	if !containsFold(where, "blocked_models") {
+		t.Fatalf("model_blocked where=%q", where)
+	}
+}
+
+func containsFold(s, sub string) bool {
+	return strings.Contains(strings.ToLower(s), strings.ToLower(sub))
 }

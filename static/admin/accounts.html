@@ -221,6 +221,18 @@
     <button class="g2a-btn g2a-btn-default" id="btn-acc-push-cliproxyapi-all" title="将全部账号同步到已配置的 CLIProxyAPI">导入 CLIProxyAPI（全部）</button>
     <button class="g2a-btn g2a-btn-default" id="btn-acc-export-cliproxyapi-format" title="下载 CLIProxyAPI auth 包（type=cliproxyapi-auth-bundle）">导出 CLIProxyAPI</button>
     <button class="g2a-btn g2a-btn-danger" id="btn-acc-delete-selected">删除选中</button>
+    <label class="g2a-sort-wrap" for="acc-filter-status" title="按轮询状态筛选">
+      <span class="g2a-sort-label">状态</span>
+      <select id="acc-filter-status" class="g2a-sort-select" aria-label="状态筛选">
+        <option value="" selected>全部状态</option>
+        <option value="live">轮询中</option>
+        <option value="cooldown">冷却中</option>
+        <option value="model_blocked">模型封禁</option>
+        <option value="quota_disabled">额度禁用</option>
+        <option value="disabled">已禁用</option>
+        <option value="expired">过期</option>
+      </select>
+    </label>
     <label class="g2a-sort-wrap" for="acc-filter-sso" title="按是否保存 SSO 筛选">
       <span class="g2a-sort-label">SSO</span>
       <select id="acc-filter-sso" class="g2a-sort-select" aria-label="SSO 筛选">
@@ -246,6 +258,7 @@
       </select>
     </label>
   </div>
+  <div id="acc-status-chips" class="g2a-toolbar" style="gap:6px;margin:6px 0 0;flex-wrap:wrap"></div>
   <div id="acc-selection-info" class="g2a-muted" style="margin:8px 0 10px">—</div>
   <div id="accounts-empty" class="g2a-empty hidden" style="display:none">暂无账号，请设备码登录或导入 Token。</div>
   <div id="quota-summary" class="g2a-muted" style="margin-bottom:8px"></div>

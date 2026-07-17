@@ -1797,10 +1797,38 @@ func serveAdminAccounts(w http.ResponseWriter, r *http.Request, options Options)
 	}
 	page := intQuery(query.Get("page"), 1)
 	pageSize := intQuery(query.Get("page_size"), 25)
-	result, err := options.Store.ListAccountSummaries(r.Context(), page, pageSize, query.Get("q"), query.Get("sort"))
+	filter := postgres.AccountListFilter{
+		Query:  query.Get("q"),
+		Sort:   query.Get("sort"),
+		Status: query.Get("status"),
+	}
+	if raw := strings.TrimSpace(strings.ToLower(query.Get("has_sso"))); raw != "" {
+		v := raw == "1" || raw == "true" || raw == "yes" || raw == "on"
+		// distinguish false explicitly
+		if raw == "0" || raw == "false" || raw == "no" || raw == "off" {
+			v = false
+			filter.HasSSO = &v
+		} else if raw == "1" || raw == "true" || raw == "yes" || raw == "on" {
+			v = true
+			filter.HasSSO = &v
+		}
+	}
+	if truthy(query.Get("ids_only")) || truthy(query.Get("ids")) {
+		filter.IDsOnly = true
+		// return up to 20k matching ids for "筛选全选"
+		if pageSize < 1000 {
+			pageSize = 20000
+		}
+		page = 1
+	}
+	result, err := options.Store.ListAccountSummariesFiltered(r.Context(), page, pageSize, filter)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"detail": err.Error()})
 		return
+	}
+	// Ensure frontend can re-sync filter chips.
+	if result.Status == "" {
+		result.Status = strings.TrimSpace(query.Get("status"))
 	}
 	writeJSON(w, http.StatusOK, result)
 }
