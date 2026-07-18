@@ -53,15 +53,17 @@ func defaultHTTPClient() *http.Client {
 			MaxIdleConnsPerHost: 100,               // 增加每个 host 的空闲连接数，支持高并发
 			MaxConnsPerHost:     200,               // 增加每个 host 的最大连接数
 			IdleConnTimeout:     120 * time.Second, // 延长空闲连接保持时间
-			TLSHandshakeTimeout: 10 * time.Second,
+			TLSHandshakeTimeout: 8 * time.Second,
 			DialContext: (&net.Dialer{
-				Timeout:   5 * time.Second,  // fail-fast dial for failover TTFT
+				Timeout:   3 * time.Second,  // fail-fast dial for failover TTFT
 				KeepAlive: 60 * time.Second, // 延长 TCP keepalive
 			}).DialContext,
 			ForceAttemptHTTP2:     true,
 			DisableCompression:    false,
 			ExpectContinueTimeout: 1 * time.Second,
-			ResponseHeaderTimeout: 20 * time.Second, // fail-fast first-byte; long streams keep body open after headers
+			// Failover TTFT: do not sit 20s on a hung first-byte account.
+			// Long streams keep the body open after headers arrive.
+			ResponseHeaderTimeout: 12 * time.Second,
 			DisableKeepAlives:     false,
 			WriteBufferSize:       32 * 1024, // 增加写缓冲，提高大请求性能
 			ReadBufferSize:        32 * 1024, // 增加读缓冲，提高大响应性能
@@ -73,22 +75,31 @@ func (c *Client) Open(ctx context.Context, account Account, model string, body m
 	if c.HTTP == nil {
 		c.HTTP = defaultHTTPClient()
 	}
-	payload := cloneMap(body)
-	payload["model"] = model
-	payload["stream"] = true
-	options, _ := payload["stream_options"].(map[string]any)
-	options = cloneMap(options)
-	options["include_usage"] = true
-	payload["stream_options"] = options
+	// CPA / cli-chat-proxy cache path: always call /responses (not /chat/completions).
+	// Convert chat-style body → responses body, then bridge SSE back to chat chunks
+	// so internal/proxy can keep parsing chat.completion.chunk frames.
+	src := cloneMap(body)
+	convID := extractConvID(src)
+	if convID != "" {
+		if raw, _ := src["prompt_cache_key"].(string); strings.TrimSpace(raw) == "" {
+			src["prompt_cache_key"] = convID
+		}
+	}
+	payload := chatToResponsesPayload(src, model)
+	if convID != "" {
+		if raw, _ := payload["prompt_cache_key"].(string); strings.TrimSpace(raw) == "" {
+			payload["prompt_cache_key"] = convID
+		}
+	}
 	encoded, err := json.Marshal(payload)
 	if err != nil {
 		return nil, err
 	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(c.BaseURL, "/")+"/chat/completions", bytes.NewReader(encoded))
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(c.BaseURL, "/")+"/responses", bytes.NewReader(encoded))
 	if err != nil {
 		return nil, err
 	}
-	for name, value := range c.Headers(account.Token, model) {
+	for name, value := range c.Headers(account.Token, model, convID) {
 		request.Header.Set(name, value)
 	}
 	response, err := c.HTTP.Do(request)
@@ -97,39 +108,86 @@ func (c *Client) Open(ctx context.Context, account Account, model string, body m
 	}
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		defer response.Body.Close()
-		body, _ := io.ReadAll(io.LimitReader(response.Body, 64<<10))
+		errBody, _ := io.ReadAll(io.LimitReader(response.Body, 64<<10))
 		return nil, &UpstreamError{
-			Status: response.StatusCode, Body: string(body),
+			Status: response.StatusCode, Body: string(errBody),
 			RetryAfter: response.Header.Get("Retry-After"),
 		}
+	}
+	// Translate Responses SSE → chat.completion.chunk SSE for the proxy stack.
+	response.Body = responsesToChatStream(response.Body)
+	if response.Header != nil {
+		response.Header.Set("Content-Type", "text/event-stream")
+		response.Header.Set("X-Grok2API-Upstream-Protocol", "responses")
 	}
 	return response, nil
 }
 
-func (c *Client) Headers(token, model string) map[string]string {
+func (c *Client) Headers(token, model string, convID ...string) map[string]string {
 	version := c.CLIversion
 	if version == "" {
 		version = "0.2.93"
 	}
-	surface := c.ClientSurface
-	if surface == "" {
-		surface = "grok-cli"
-	}
+	// Defaults match CPA/xAI workspace shell headers that hit prompt cache.
+	// Do not force model override by default: CPA cache-hit traffic often omits it.
 	identifier := c.ClientIdentifier
 	if identifier == "" {
-		identifier = "grokcli-2api"
+		identifier = "grok-shell"
 	}
-	return map[string]string{
+	out := map[string]string{
 		"Content-Type":             "application/json",
 		"Authorization":            "Bearer " + token,
 		"X-XAI-Token-Auth":         "xai-grok-cli",
-		"x-grok-model-override":    model,
 		"x-grok-client-version":    version,
-		"x-grok-client-surface":    surface,
 		"x-grok-client-identifier": identifier,
-		"User-Agent":               "grok-cli/" + version,
-		"Accept":                   "text/event-stream, application/json",
+		"User-Agent":               "xai-grok-workspace/" + version,
+		"Accept":                   "text/event-stream",
+		"Connection":               "Keep-Alive",
 	}
+	// Keep optional surface/model override only when explicitly configured.
+	if surface := strings.TrimSpace(c.ClientSurface); surface != "" {
+		out["x-grok-client-surface"] = surface
+	}
+	// Model override is optional. Prefer body model; only set override when ClientSurface
+	// is configured for legacy grok-cli compatibility, or model is non-empty AND
+	// explicitly requested via env later. For cache parity with CPA, leave unset.
+	_ = model
+	id := ""
+	if len(convID) > 0 {
+		id = strings.TrimSpace(convID[0])
+	}
+	if id != "" {
+		// CPA sets both casings; Go Header.Set canonicalizes keys.
+		out["x-grok-conv-id"] = id
+	}
+	return out
+}
+
+// extractConvID picks a stable session/cache key from the upstream body for
+// x-grok-conv-id. Preference matches CPA: prompt_cache_key first.
+func extractConvID(body map[string]any) string {
+	if body == nil {
+		return ""
+	}
+	for _, key := range []string{
+		"prompt_cache_key",
+		"conversation_id",
+		"conversation",
+		"thread_id",
+		"session_id",
+	} {
+		if value, _ := body[key].(string); strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	if meta, _ := body["metadata"].(map[string]any); meta != nil {
+		for _, key := range []string{"prompt_cache_key", "session_id", "sessionId", "thread_id", "conversation_id", "user_id"} {
+			if value, _ := meta[key].(string); strings.TrimSpace(value) != "" {
+				return strings.TrimSpace(value)
+			}
+		}
+	}
+	return ""
 }
 
 func ReadSSE(reader io.Reader, emit func(Event) error) error {
@@ -167,16 +225,27 @@ func ReadSSE(reader io.Reader, emit func(Event) error) error {
 
 // ReadSSEWithIdle is like ReadSSE but invokes onIdle whenever no complete SSE
 // frame arrives for idle duration. Used for Anthropic/OpenAI stream keepalives.
+//
+// On early consumer exit (emit/onIdle error): closes the reader (if possible) so
+// the scanner unblocks, then drains residual channel events until done so the
+// background goroutine always exits (no leak under soft-disconnect storms).
 func ReadSSEWithIdle(reader io.Reader, idle time.Duration, emit func(Event) error, onIdle func() error) error {
 	if idle <= 0 || onIdle == nil {
 		return ReadSSE(reader, emit)
 	}
+	type closer interface{ Close() error }
+	closeReader := func() {
+		if c, ok := reader.(closer); ok {
+			_ = c.Close()
+		}
+	}
+
 	type result struct {
 		event Event
 		err   error
 		done  bool
 	}
-	ch := make(chan result, 1)
+	ch := make(chan result, 8)
 	go func() {
 		err := ReadSSE(reader, func(event Event) error {
 			ch <- result{event: event}
@@ -184,6 +253,17 @@ func ReadSSEWithIdle(reader io.Reader, idle time.Duration, emit func(Event) erro
 		})
 		ch <- result{err: err, done: true}
 	}()
+
+	// drainUntilDone consumes residual events after early return so the scanner
+	// goroutine is never stuck forever on a full channel send.
+	drainUntilDone := func() {
+		for item := range ch {
+			if item.done {
+				return
+			}
+		}
+	}
+
 	timer := time.NewTimer(idle)
 	defer timer.Stop()
 	for {
@@ -200,10 +280,14 @@ func ReadSSEWithIdle(reader io.Reader, idle time.Duration, emit func(Event) erro
 			}
 			timer.Reset(idle)
 			if err := emit(item.event); err != nil {
+				closeReader()
+				go drainUntilDone()
 				return err
 			}
 		case <-timer.C:
 			if err := onIdle(); err != nil {
+				closeReader()
+				go drainUntilDone()
 				return err
 			}
 			timer.Reset(idle)

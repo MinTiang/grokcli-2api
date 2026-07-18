@@ -112,58 +112,58 @@
       "name": "GROK2API_RUNTIME",
       "type": "enum",
       "values": [
-        "go",
-        "python"
+        "go"
       ],
       "default": "go",
-      "scope": "startup_cutover"
+      "scope": "startup",
+      "go_behavior": "public Python main removed; only go is accepted (entrypoint rejects python)"
     },
     {
       "name": "GROK2API_GO_PUBLIC_READ",
       "type": "boolean",
-      "default": false,
+      "default": true,
       "scope": "staged_go_route"
     },
     {
       "name": "GROK2API_GO_CHAT",
       "type": "boolean",
-      "default": false,
+      "default": true,
       "scope": "staged_go_route"
     },
     {
       "name": "GROK2API_GO_MESSAGES",
       "type": "boolean",
-      "default": false,
+      "default": true,
       "scope": "staged_go_route"
     },
     {
       "name": "GROK2API_GO_RESPONSES",
       "type": "boolean",
-      "default": false,
+      "default": true,
       "scope": "staged_go_route"
     },
     {
       "name": "GROK2API_GO_ADMIN_READ",
       "type": "boolean",
-      "default": false,
+      "default": true,
       "scope": "staged_go_route"
     },
     {
       "name": "GROK2API_GO_ADMIN_WRITE",
       "type": "boolean",
-      "default": false,
+      "default": true,
       "scope": "staged_go_route"
     },
     {
       "name": "GROK2API_GO_MAINTAINER",
       "type": "boolean",
-      "default": false,
+      "default": true,
       "scope": "staged_go_background"
     },
     {
       "name": "GROK2API_GO_WRITES",
       "type": "boolean",
-      "default": false,
+      "default": true,
       "scope": "data_safety"
     },
     {
@@ -174,7 +174,7 @@
         "canary",
         "all"
       ],
-      "default": "disabled",
+      "default": "all",
       "scope": "data_safety"
     },
     {

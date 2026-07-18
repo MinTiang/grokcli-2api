@@ -20,7 +20,7 @@
       "additionalProperties": false,
       "required": ["implementation", "version"],
       "properties": {
-        "implementation": {"const": "python"},
+        "implementation": {"enum": ["go", "python"]},
         "version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"}
       }
     },

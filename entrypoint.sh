@@ -6,23 +6,35 @@
 set -euo pipefail
 cd /app
 
-runtime="$(echo "${GROK2API_RUNTIME:-python}" | tr '[:upper:]' '[:lower:]')"
+runtime="$(echo "${GROK2API_RUNTIME:-go}" | tr '[:upper:]' '[:lower:]')"
 case "${runtime}" in
-  go)
-    APP_CMD=("/app/bin/grok2api")
+  go|"")
+    if [[ ! -x /app/bin/grok2api && -x ./bin/grok2api ]]; then
+      APP_CMD=("./bin/grok2api")
+    else
+      APP_CMD=("/app/bin/grok2api")
+    fi
+    if [[ ! -x "${APP_CMD[0]}" ]]; then
+      echo "[entrypoint] ERROR: Go binary ${APP_CMD[0]} not found/executable" >&2
+      exit 2
+    fi
+    runtime=go
     ;;
-  python|"")
-    APP_CMD=("python" "app.py")
+  python)
+    echo "[entrypoint] ERROR: GROK2API_RUNTIME=python is removed; only Go main + Python sidecar remain" >&2
+    echo "[entrypoint] set GROK2API_RUNTIME=go (default) and keep registration/captcha sidecars" >&2
+    exit 2
     ;;
   *)
-    echo "[entrypoint] invalid GROK2API_RUNTIME=${GROK2API_RUNTIME}; expected python or go" >&2
+    echo "[entrypoint] invalid GROK2API_RUNTIME=${GROK2API_RUNTIME}; expected go" >&2
     exit 2
     ;;
 esac
 if [[ "$#" -gt 0 ]]; then
-  # Docker's default CMD is still `python app.py` for Python fallback. Do not let
-  # that default mask GROK2API_RUNTIME=go, but keep explicit command overrides.
-  if [[ "${runtime}" == "go" && "$#" -eq 2 && "$1" == "python" && "$2" == "app.py" ]]; then
+  # Ignore legacy `python app.py` CMD leftovers from older images/docs.
+  if [[ "$#" -eq 2 && "$1" == "python" && "$2" == "app.py" ]]; then
+    :
+  elif [[ "$#" -eq 1 && "$1" == "/app/bin/grok2api" ]]; then
     :
   else
     APP_CMD=("$@")

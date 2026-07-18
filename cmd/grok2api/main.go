@@ -66,6 +66,14 @@ func main() {
 			if adminSessions == nil {
 				adminSessions = store
 			}
+			// One-shot: free-usage mis-tags (模型封禁) → durable cooldown only.
+			repairCtx, repairDone := context.WithTimeout(context.Background(), 30*time.Second)
+			if n, err := store.RepairFreeUsageModelBlocks(repairCtx); err != nil {
+				slog.Warn("repair free-usage model blocks failed", "error", err)
+			} else if n > 0 {
+				slog.Info("repaired free-usage model blocks into cooldown", "accounts", n)
+			}
+			repairDone()
 		}
 	}
 
@@ -120,6 +128,20 @@ func main() {
 		}
 	}
 
+	// Live config pointer so admin settings writes hot-reload without restart.
+	runtimeCfg := cfg
+	if store != nil {
+		if settings, err := store.PublicSettings(context.Background()); err == nil {
+			runtimeCfg.ApplyStoreSettings(settings)
+			slog.Info("loaded durable settings into runtime config",
+				"default_model", runtimeCfg.DefaultModel,
+				"sse_keepalive", runtimeCfg.SSEKeepalive.String(),
+				"outbound_max_tools", runtimeCfg.OutboundMaxTools,
+			)
+		} else {
+			slog.Warn("failed to load durable settings at boot", "error", err)
+		}
+	}
 	handler := server.NewMux(server.Options{
 		Ready:             readiness.Ready,
 		Reason:            readiness.Reason,
@@ -135,7 +157,7 @@ func main() {
 		Store:             store,
 		AdminSessions:     adminSessions,
 		PickObserver:      redis.NewPickObserver(redisClient),
-		AffinityStore:     redis.NewChatAffinity(redisClient, cfg.SSEKeepalive*1800),
+		AffinityStore:     redis.NewChatAffinity(redisClient, 24*time.Hour),
 		Upstream:          &grok.Client{BaseURL: cfg.UpstreamBase},
 		Redis:             redisClient,
 		Leader:            leader,
@@ -143,6 +165,7 @@ func main() {
 		ModelHealth:       healthSvc,
 		Quota:             quota.New(store, cfg.UpstreamBase),
 		Config:            cfg,
+		RuntimeConfig:     &runtimeCfg,
 		RegistrationURL:   cfg.RegistrationServiceURL,
 		RegistrationToken: cfg.RegistrationToken,
 	})
@@ -150,10 +173,10 @@ func main() {
 		Addr:              cfg.Address(),
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       0, // 不设置 ReadTimeout，避免影响流式响应
-		WriteTimeout:      0, // 不设置 WriteTimeout，流式响应需要持续写入
+		ReadTimeout:       0,                 // 不设置 ReadTimeout，避免影响流式响应
+		WriteTimeout:      0,                 // 不设置 WriteTimeout，流式响应需要持续写入
 		IdleTimeout:       120 * time.Second, // 增加空闲超时，支持长连接
-		MaxHeaderBytes:    1 << 20, // 1MB header limit
+		MaxHeaderBytes:    1 << 20,           // 1MB header limit
 	}
 
 	go func() {

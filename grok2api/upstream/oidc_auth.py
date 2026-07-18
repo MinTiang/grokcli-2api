@@ -914,7 +914,19 @@ def _device_poll_worker(session_id: str) -> None:
                                         entry["last_name"] = u["family_name"]
                     except Exception:
                         pass
+                # Mark durable source so admin UI/export can tell device-login rows apart.
+                entry.setdefault("source", "device-login")
+                entry.setdefault("auth_mode", entry.get("auth_mode") or "oidc")
+                # Ensure account_pool row + durable payload land via row-level upsert.
                 upsert_entry(account_id, entry)
+                # Verify the account is readable from durable store (PG-first).
+                try:
+                    from grok2api.pool.auth_store import read_auth_entry as _rae
+                    probe = _rae(account_id)
+                    if not probe:
+                        print(f"[oidc] WARN: device-login account {account_id} not readable after upsert")
+                except Exception as _ve:  # noqa: BLE001
+                    print(f"[oidc] WARN: post-upsert verify failed: {_ve}")
                 with _lock:
                     sess = _device_sessions.get(session_id)
                     if sess:
@@ -923,6 +935,12 @@ def _device_poll_worker(session_id: str) -> None:
                         sess["account_id"] = account_id
                         sess["email"] = entry.get("email")
                         sess["finished_at"] = time.time()
+                        sess["storage"] = "postgres"
+                        try:
+                            from grok2api.pool.accounts import _accounts_store_source
+                            sess["storage"] = _accounts_store_source()
+                        except Exception:
+                            pass
                         sess["output"] = (sess.get("output") or "") + "\n" + body_text[:500]
                         _device_mirror(session_id, dict(sess))
             except Exception as e:  # noqa: BLE001

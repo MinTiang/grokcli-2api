@@ -8,6 +8,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/hm2899/grokcli-2api/internal/config"
@@ -29,10 +30,33 @@ type APIKeyRecord struct {
 type APIKeyVerifier struct {
 	cfg   config.Config
 	store *postgres.Connector
+
+	mu            sync.Mutex
+	keyCache      map[string]apiKeyCacheEntry
+	requiredCache *requiredCacheEntry
 }
 
+type apiKeyCacheEntry struct {
+	rec     *APIKeyRecord
+	expires time.Time
+}
+
+type requiredCacheEntry struct {
+	required bool
+	expires  time.Time
+}
+
+const (
+	apiKeyCacheTTL       = 30 * time.Second
+	authRequiredCacheTTL = 5 * time.Second
+)
+
 func NewAPIKeyVerifier(cfg config.Config, store *postgres.Connector) *APIKeyVerifier {
-	return &APIKeyVerifier{cfg: cfg, store: store}
+	return &APIKeyVerifier{
+		cfg:      cfg,
+		store:    store,
+		keyCache: map[string]apiKeyCacheEntry{},
+	}
 }
 
 func (v *APIKeyVerifier) Require(ctx context.Context, r *http.Request) (*APIKeyRecord, error) {
@@ -73,7 +97,23 @@ func (v *APIKeyVerifier) AuthRequired(ctx context.Context) (bool, error) {
 	if v.store == nil {
 		return false, nil
 	}
-	return v.store.HasEnabledAPIKeys(ctx)
+	now := time.Now()
+	v.mu.Lock()
+	if v.requiredCache != nil && now.Before(v.requiredCache.expires) {
+		required := v.requiredCache.required
+		v.mu.Unlock()
+		return required, nil
+	}
+	v.mu.Unlock()
+
+	required, err := v.store.HasEnabledAPIKeys(ctx)
+	if err != nil {
+		return false, err
+	}
+	v.mu.Lock()
+	v.requiredCache = &requiredCacheEntry{required: required, expires: now.Add(authRequiredCacheTTL)}
+	v.mu.Unlock()
+	return required, nil
 }
 
 func (v *APIKeyVerifier) Verify(ctx context.Context, token string) (*APIKeyRecord, error) {
@@ -88,7 +128,25 @@ func (v *APIKeyVerifier) Verify(ctx context.Context, token string) (*APIKeyRecor
 	if v.store == nil {
 		return nil, nil
 	}
-	row, err := v.store.FindAPIKeyByHash(ctx, hashKey(token))
+	h := hashKey(token)
+	now := time.Now()
+	v.mu.Lock()
+	if entry, ok := v.keyCache[h]; ok && now.Before(entry.expires) {
+		rec := cloneAPIKeyRecord(entry.rec)
+		v.mu.Unlock()
+		if rec != nil {
+			// Async usage touch — never block TTFT.
+			go func(id string) {
+				bg, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+				defer cancel()
+				_ = v.store.TouchAPIKeyUsage(bg, id)
+			}(rec.ID)
+		}
+		return rec, nil
+	}
+	v.mu.Unlock()
+
+	row, err := v.store.FindAPIKeyByHash(ctx, h)
 	if err != nil || row == nil || !row.Enabled {
 		return nil, err
 	}
@@ -101,8 +159,37 @@ func (v *APIKeyVerifier) Verify(ctx context.Context, token string) (*APIKeyRecor
 		RequestCount: row.RequestCount,
 		LastUsedAt:   row.LastUsedAt,
 	}
-	_ = v.store.TouchAPIKeyUsage(ctx, rec.ID)
+	v.mu.Lock()
+	v.keyCache[h] = apiKeyCacheEntry{rec: cloneAPIKeyRecord(rec), expires: now.Add(apiKeyCacheTTL)}
+	// Opportunistic prune.
+	if len(v.keyCache) > 2048 {
+		for k, e := range v.keyCache {
+			if now.After(e.expires) {
+				delete(v.keyCache, k)
+			}
+		}
+	}
+	v.mu.Unlock()
+
+	// Async usage touch so auth never waits on PG UPDATE.
+	go func(id string) {
+		bg, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+		defer cancel()
+		_ = v.store.TouchAPIKeyUsage(bg, id)
+	}(rec.ID)
 	return rec, nil
+}
+
+func cloneAPIKeyRecord(in *APIKeyRecord) *APIKeyRecord {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	if in.LastUsedAt != nil {
+		t := *in.LastUsedAt
+		out.LastUsedAt = &t
+	}
+	return &out
 }
 
 func tokenFromRequest(r *http.Request) string {

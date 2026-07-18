@@ -43,13 +43,24 @@ func (o PickObserver) MarkPick(ctx context.Context, accountID string) {
 	if o.Client == nil {
 		return
 	}
-	_, _ = o.Client.MarkInflight(ctx, accountID, InflightTTLSeconds)
-	_, _ = o.Client.MarkSoftUsed(ctx, accountID, SoftUsedTTLSeconds, time.Now())
+	// Fire-and-forget: never block TTFT on inflight/soft_used bookkeeping.
+	// Use a detached short timeout so request cancel does not drop the mark.
+	go func() {
+		bg, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+		defer cancel()
+		// One pooled connection: INCR+EXPIRE pipeline + soft_used SETEX.
+		_, _ = o.Client.MarkInflight(bg, accountID, InflightTTLSeconds)
+		_, _ = o.Client.MarkSoftUsed(bg, accountID, SoftUsedTTLSeconds, time.Now())
+	}()
 }
 
 func (o PickObserver) ReleasePick(ctx context.Context, accountID string) {
 	if o.Client == nil {
 		return
 	}
-	_ = o.Client.ReleaseInflight(ctx, accountID)
+	go func() {
+		bg, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+		defer cancel()
+		_ = o.Client.ReleaseInflight(bg, accountID)
+	}()
 }

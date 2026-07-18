@@ -31,7 +31,7 @@ ROOT = Path(__file__).resolve().parents[2]
 GBA = ROOT / "grok-build-auth"
 DATA_DIR = ROOT / "data"
 REGISTER_SSO_DIR = DATA_DIR / "register_sso"
-ADAPTER_BUILD = "v1.9.81-reg-sso-account-persist"
+ADAPTER_BUILD = "v1.9.93-reg-sso-pg-verify"
 # Newly registered accounts often need a short settle window before probe.
 REGISTER_PROBE_DELAY_SEC = float(
     os.environ.get("GROK2API_REG_PROBE_DELAY_SEC", "30") or 30
@@ -606,9 +606,20 @@ def _clean_old_sessions() -> None:
 
 
 def _compact_session(sess: dict[str, Any]) -> dict[str, Any]:
-    out = dict(sess)
+    # Only JSON-safe public fields. Process-local objects (e.g. `_receiver`,
+    # `_client`) must never leak into FastAPI / admin responses.
+    out: dict[str, Any] = {}
+    for k, v in (sess or {}).items():
+        if not isinstance(k, str):
+            continue
+        if k.startswith("_"):
+            continue
+        if callable(v):
+            continue
+        out[k] = v
     out.pop("_client", None)
     out.pop("_oauth_client", None)
+    out.pop("_receiver", None)
     out.pop("password", None)
     out.pop("yescaptcha_key", None)
     # Prefer explicit imported ids; fall back to auth_json summary for UI/logs.
@@ -1156,9 +1167,19 @@ def _proxy_pool(
     username: str | None = None,
     password: str | None = None,
 ) -> list[str]:
-    """Parse multi-line proxy text into full proxy URLs."""
+    """Parse multi-line proxy text into full proxy URLs.
+
+    Preference:
+      1) explicit proxy_text (+ optional user/pass)
+      2) env / outbound_proxy_config pool
+      3) auto-discovered peer proxy (privoxy etc.)
+    """
     try:
-        from grok2api.upstream.proxy_pool import parse_proxy_pool
+        from grok2api.upstream.proxy_pool import (
+            parse_proxy_pool,
+            get_outbound_proxy_source,
+            first_working_proxy,
+        )
 
         pool = parse_proxy_pool(
             proxy_text,
@@ -1168,6 +1189,22 @@ def _proxy_pool(
         )
         if pool:
             return pool
+        # When registration form proxy is empty, reuse outbound pool text/auth.
+        src = get_outbound_proxy_source() or {}
+        if src.get("enabled", True):
+            pool = list(src.get("pool") or [])
+            if not pool:
+                pool = parse_proxy_pool(
+                    src.get("text"),
+                    username=src.get("username"),
+                    password=src.get("password"),
+                    fallback_env=False,
+                )
+            if pool:
+                return pool
+        auto = first_working_proxy()
+        if auto:
+            return [auto]
     except Exception:
         pass
     # Fallback: treat as single proxy via classic normalizer.
@@ -3014,11 +3051,51 @@ def _run_registration(
             )
         # Registration import is durable PostgreSQL (accounts + account_pool).
         # auth.json is not written at runtime in hybrid mode (export-only).
-        if import_result.get("storage") and import_result.get("storage") != "postgres":
+        storage = import_result.get("storage")
+        if not storage:
+            try:
+                storage = accounts._accounts_store_source()
+            except Exception:
+                storage = "unknown"
+        import_result["storage"] = storage
+        if storage != "postgres":
             print(
-                f"[grok-build-auth] WARN: import storage={import_result.get('storage')} "
-                f"(expected postgres). Check DATABASE_URL."
+                f"[grok-build-auth] WARN: import storage={storage} "
+                f"(expected postgres). Check DATABASE_URL / STORE_BACKEND."
             )
+        # Verify SSO cookie actually landed in durable store (re-read by id).
+        try:
+            imported_probe_ids = [
+                str(x.get("id"))
+                for x in (import_result.get("imported") or [])
+                if isinstance(x, dict) and x.get("id")
+            ]
+            if sso_cookie and imported_probe_ids:
+                from grok2api.pool.accounts import get_sso_value as _gsv
+                try:
+                    from grok2api.pool.auth_store import read_auth_entry as _rae
+                except Exception:
+                    _rae = None  # type: ignore[assignment]
+                for aid in imported_probe_ids[:5]:
+                    hit = _rae(aid) if _rae is not None else None
+                    payload = hit[1] if isinstance(hit, tuple) and len(hit) == 2 else None
+                    if not isinstance(payload, dict):
+                        continue
+                    if _gsv(payload):
+                        continue
+                    print(
+                        f"[grok-build-auth] WARN: account {aid} imported without SSO "
+                        f"in payload; rewriting sso field [{ADAPTER_BUILD}]"
+                    )
+                    fix = dict(payload)
+                    fix["sso"] = sso_cookie
+                    fix["sso_cookie"] = sso_cookie
+                    if reg_password:
+                        fix.setdefault("password", reg_password)
+                        fix.setdefault("register_password", reg_password)
+                    accounts.import_auth_payload(fix, merge=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[grok-build-auth] WARN: post-import SSO verify failed: {e}")
         imported_rows = [
             x for x in (import_result.get("imported") or []) if isinstance(x, dict)
         ]
@@ -4141,13 +4218,9 @@ def get_registration_session(
     sess = _load_reg_sess(sid)
     if not sess:
         return None
-    out = dict(sess)
-    out.pop("_client", None)
-    out.pop("_oauth_client", None)
-    out.pop("password", None)
-    out.pop("yescaptcha_key", None)
-    if not include_auth_json:
-        out.pop("auth_json", None)
+    out = _compact_session(sess)
+    if include_auth_json and isinstance(sess.get("auth_json"), (dict, list)):
+        out["auth_json"] = sess.get("auth_json")
     return out
 
 

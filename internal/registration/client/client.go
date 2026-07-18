@@ -75,6 +75,18 @@ func (c *Client) StopAll(ctx context.Context) (map[string]any, error) {
 	return c.do(ctx, http.MethodPost, "/stop", map[string]any{}, nil)
 }
 
+func (c *Client) StartDeviceLogin(ctx context.Context, request map[string]any) (map[string]any, error) {
+	return c.doAbsolute(ctx, http.MethodPost, "/internal/device/v1/login", request, nil)
+}
+
+func (c *Client) DeviceLoginSession(ctx context.Context, sessionID string) (map[string]any, error) {
+	return c.doAbsolute(ctx, http.MethodGet, "/internal/device/v1/sessions/"+url.PathEscape(sessionID), nil, nil)
+}
+
+func (c *Client) DeviceLoginSessions(ctx context.Context) (map[string]any, error) {
+	return c.doAbsolute(ctx, http.MethodGet, "/internal/device/v1/sessions", nil, nil)
+}
+
 func (c *Client) StartSSOImport(ctx context.Context, request map[string]any) (map[string]any, error) {
 	return c.doAbsolute(ctx, http.MethodPost, "/internal/sso/v1/import", request, nil)
 }

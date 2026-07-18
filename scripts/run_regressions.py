@@ -1,26 +1,24 @@
 #!/usr/bin/env python3
-"""Run every tracked standalone regression from the repository root."""
+"""Compatibility / contract checks after Python public main removal.
+
+Legacy scripts/_test_*.py regressions were deleted with the Python public API.
+This runner keeps CI green by validating the remaining contract artifacts and
+version pin files that release automation still depends on.
+"""
 
 from __future__ import annotations
 
-import os
-import subprocess
+import json
+import pathlib
+import re
 import sys
-import tempfile
-from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
-def _tracked_tests() -> list[Path]:
-    result = subprocess.run(
-        ["git", "ls-files", "scripts/_test_*.py"],
-        cwd=ROOT,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    return [ROOT / line for line in result.stdout.splitlines() if line.strip()]
+def _fail(msg: str) -> int:
+    print(f"FAIL: {msg}", file=sys.stderr)
+    return 1
 
 
 def main() -> int:
@@ -28,56 +26,67 @@ def main() -> int:
         print("regressions require assertions; do not use python -O", file=sys.stderr)
         return 2
 
-    tests = _tracked_tests()
-    if not tests:
-        print("no tracked regression scripts found", file=sys.stderr)
-        return 1
+    # Contract schema
+    try:
+        import jsonschema  # type: ignore
+    except ImportError:
+        return _fail("jsonschema not installed (pip install jsonschema)")
 
-    env = dict(os.environ)
-    env["PYTHONPATH"] = os.pathsep.join(
-        part for part in (str(ROOT), env.get("PYTHONPATH", "")) if part
+    root = ROOT / "contracts"
+    schema = json.loads((root / "manifest.schema.json").read_text(encoding="utf-8"))
+    manifest = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+    jsonschema.validate(manifest, schema)
+    print("ok contracts/manifest.json schema")
+
+    env_manifest = json.loads((root / "env-manifest.json").read_text(encoding="utf-8"))
+    runtime = next(
+        (e for e in env_manifest.get("env", env_manifest.get("variables", [])) if e.get("name") == "GROK2API_RUNTIME"),
+        None,
     )
-    # The standalone regressions are unit-level compatibility checks. Explicitly
-    # disable shared stores so config.py's production localhost defaults cannot
-    # make CI wait for a PostgreSQL/Redis instance that the tests never use.
-    env["DATABASE_URL"] = ""
-    env["GROK2API_DATABASE_URL"] = ""
-    env["REDIS_URL"] = ""
-    env["GROK2API_REDIS_URL"] = ""
-    env["GROK2API_STORE_BACKEND"] = "file"
-    env["GROK2API_WORKERS"] = "1"
-    env["GROK2API_REQUIRE_SHARED_STORES"] = "0"
-    env["GROK2API_OPEN_BROWSER"] = "0"
-    env["PYTHONDONTWRITEBYTECODE"] = "1"
-    env["PYTHONUNBUFFERED"] = "1"
+    # Support both top-level shapes used historically.
+    if runtime is None and isinstance(env_manifest.get("variables"), list):
+        runtime = next((e for e in env_manifest["variables"] if e.get("name") == "GROK2API_RUNTIME"), None)
+    if runtime is None and isinstance(env_manifest.get("env"), list):
+        runtime = next((e for e in env_manifest["env"] if e.get("name") == "GROK2API_RUNTIME"), None)
+    # Fall back: scan any list of dicts under common keys.
+    if runtime is None:
+        for key, val in env_manifest.items():
+            if isinstance(val, list):
+                for item in val:
+                    if isinstance(item, dict) and item.get("name") == "GROK2API_RUNTIME":
+                        runtime = item
+                        break
+            if runtime is not None:
+                break
+    if runtime is None:
+        return _fail("GROK2API_RUNTIME missing from env-manifest.json")
+    values = runtime.get("values") or []
+    if values != ["go"]:
+        return _fail(f"GROK2API_RUNTIME values must be ['go'], got {values!r}")
+    print("ok GROK2API_RUNTIME is go-only")
 
-    failed: list[str] = []
-    with tempfile.TemporaryDirectory(prefix="g2a-regressions-") as data_dir:
-        env["GROK2API_DATA_DIR"] = data_dir
-        for test in tests:
-            relative = test.relative_to(ROOT)
-            print(f"\n==> {relative}", flush=True)
-            try:
-                result = subprocess.run(
-                    [sys.executable, "-B", str(test)],
-                    cwd=ROOT,
-                    env=env,
-                    timeout=120,
-                )
-            except subprocess.TimeoutExpired:
-                print(f"TIMEOUT: {relative}", file=sys.stderr)
-                failed.append(str(relative))
-                continue
-            if result.returncode:
-                failed.append(str(relative))
+    # Version pins: grok2api/app.py APP_VERSION == internal/buildinfo.Version
+    py = (ROOT / "grok2api" / "app.py").read_text(encoding="utf-8")
+    go = (ROOT / "internal" / "buildinfo" / "buildinfo.go").read_text(encoding="utf-8")
+    pv = re.search(r'APP_VERSION\s*=\s*"([^"]+)"', py)
+    gv = re.search(r'Version\s*=\s*"([^"]+)"', go)
+    if not pv or not gv:
+        return _fail("could not parse APP_VERSION / Version")
+    if pv.group(1) != gv.group(1):
+        return _fail(f"version mismatch python={pv.group(1)} go={gv.group(1)}")
+    print(f"ok version pin {pv.group(1)}")
 
-    if failed:
-        print("\nfailed regressions:", file=sys.stderr)
-        for name in failed:
-            print(f"  - {name}", file=sys.stderr)
-        return 1
+    # Sidecar modules still importable (no full FastAPI public app required)
+    sys.path.insert(0, str(ROOT))
+    try:
+        from grok2api.admin import sso_import  # noqa: F401
+        from grok2api.upstream import grok_build_adapter  # noqa: F401
+        import scripts.registration_service as regsvc  # noqa: F401
+    except Exception as exc:  # pragma: no cover
+        return _fail(f"sidecar import failed: {exc}")
+    print("ok sidecar imports (sso_import, grok_build_adapter, registration_service)")
 
-    print(f"\nall {len(tests)} regression scripts passed")
+    print("\nall contract regressions passed")
     return 0
 
 

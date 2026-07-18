@@ -3157,13 +3157,7 @@ def apply_outbound_proxy_config_to_runtime(
         invalidate_outbound_proxy_cache()
     except Exception:
         pass
-    try:
-        import app as _app
-
-        if hasattr(_app, "invalidate_http_clients"):
-            _app.invalidate_http_clients()
-    except Exception:
-        pass
+    # Python public app removed; Go owns HTTP clients.
     try:
         import grok2api.pool.model_health as _mh
 
