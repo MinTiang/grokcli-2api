@@ -1236,6 +1236,8 @@ function rebindPageControls() {
   if ($("btn-save-reg")) on("btn-save-reg", "onclick", () => { saveRegConfig().catch(() => {}); });
   // Soft-nav swaps registration form DOM — rebind provider select + repaint panels.
   try { bindRegMailFormControls(); } catch (e) { console.warn("bindRegMailFormControls", e); }
+  try { bindOriginSsoControls(); } catch (e) { console.warn("bindOriginSsoControls", e); }
+
   if ($("btn-refresh-reg")) on("btn-refresh-reg", "onclick", () => {
     refreshRegistrationProgress({ toastIfEmpty: true }).catch(() => {});
   });
@@ -11524,5 +11526,415 @@ try {
   });
 } catch (_) {}
 
+/* ── Origin SSO recovery (data/origin_sso) ─────────────────────────────── */
+let osrBatchId = null;
+let osrPollTimer = null;
+let osrPollInFlight = false;
+let osrCandidates = [];
+let osrFiles = [];
+const OSR_TRACK_KEY = "g2a_osr_track_v1";
+
+function osrSaveTrack() {
+  try {
+    if (!osrBatchId) {
+      sessionStorage.removeItem(OSR_TRACK_KEY);
+      return;
+    }
+    sessionStorage.setItem(
+      OSR_TRACK_KEY,
+      JSON.stringify({ batch_id: osrBatchId, saved_at: Date.now() })
+    );
+  } catch (_) {}
+}
+
+function osrClearTrack() {
+  try { sessionStorage.removeItem(OSR_TRACK_KEY); } catch (_) {}
+}
+
+function osrLoadTrack() {
+  try {
+    const raw = sessionStorage.getItem(OSR_TRACK_KEY);
+    if (!raw) return null;
+    const obj = JSON.parse(raw);
+    if (!obj || !obj.batch_id) return null;
+    // Drop stale tracks (> 12h).
+    if (Date.now() - Number(obj.saved_at || 0) > 12 * 3600 * 1000) {
+      osrClearTrack();
+      return null;
+    }
+    return obj;
+  } catch (_) {
+    return null;
+  }
+}
+
+// Re-attach to an in-flight/finished batch after a page refresh or soft-nav.
+async function osrRestoreTracked() {
+  const track = osrLoadTrack();
+  if (!track || !track.batch_id) return false;
+  osrBatchId = track.batch_id;
+  try {
+    const b = await api("/accounts/origin-sso/batches/" + encodeURIComponent(osrBatchId));
+    osrShowBox(true);
+    const pct =
+      b.percent != null ? b.percent : (b.total ? Math.round(((b.done || 0) * 100) / b.total) : 0);
+    osrSetProgress(pct, b.message || `${b.done || 0}/${b.total || 0}`, b.status || "—");
+    osrSetLog(osrFormatBatchLog(b));
+    const terminal = ["done", "partial", "error", "cancelled"].includes(
+      String(b.status || "").toLowerCase()
+    );
+    if (terminal) {
+      osrClearTrack();
+    } else {
+      osrStartPolling();
+    }
+    return true;
+  } catch (e) {
+    // Batch not found (server restarted / pruned) — drop the stale track.
+    osrClearTrack();
+    osrBatchId = null;
+    return false;
+  }
+}
+
+function osrShowBox(show) {
+  const box = $("osr-session-box");
+  if (!box) return;
+  if (show) {
+    box.classList.remove("hidden");
+    box.hidden = false;
+    box.style.display = "";
+  } else {
+    box.classList.add("hidden");
+    box.hidden = true;
+  }
+}
+
+function osrSetProgress(pct, label, status) {
+  const n = Math.max(0, Math.min(100, Number(pct) || 0));
+  const fill = $("osr-progress-fill");
+  if (fill) fill.style.width = n + "%";
+  const pctEl = $("osr-progress-pct");
+  if (pctEl) pctEl.textContent = n + "%";
+  const lab = $("osr-progress-label");
+  if (lab && label != null) lab.textContent = label;
+  const st = $("osr-status");
+  if (st && status != null) st.textContent = status;
+  const meta = $("osr-progress-meta");
+  if (meta && label != null) meta.textContent = label;
+}
+
+function osrSetLog(text) {
+  setLogPanel("osr-log", text || "", { forceShow: !!text });
+}
+
+function osrSelectedEmails() {
+  const boxes = Array.from(document.querySelectorAll("#osr-tbody input.osr-check:checked"));
+  return boxes.map((el) => el.getAttribute("data-email") || "").filter(Boolean);
+}
+
+function osrUpdateSelectInfo() {
+  const info = $("osr-select-info");
+  if (!info) return;
+  const total = (osrCandidates || []).length;
+  const sel = osrSelectedEmails().length;
+  info.textContent = sel
+    ? `已选 ${sel} / 候选 ${total} 个邮箱（确认后仅处理勾选）`
+    : `未勾选 → 将处理全部候选（共 ${total} 个邮箱）`;
+}
+
+function osrEscapeHtml(s) {
+  return String(s == null ? "" : s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+function osrEscapeAttr(s) {
+  return osrEscapeHtml(s).replace(/'/g, "&#39;");
+}
+
+function osrRenderTable(rows) {
+  const tbody = $("osr-tbody");
+  if (!tbody) return;
+  tbody.innerHTML = "";
+  (rows || []).forEach((row) => {
+    const tr = document.createElement("tr");
+    const reason = row.reason || (row.existing_expired ? "expired" : (row.existing_id ? "exists" : "new"));
+    const reasonLabel = {
+      expired: "已过期",
+      new: "新账号",
+      not_expired: "活跃(跳过)",
+      exists: "已存在",
+    }[reason] || reason;
+    const email = row.email || "";
+    const fileCount = Number(row.file_count || (Array.isArray(row.files) ? row.files.length : 1)) || 1;
+    const fileNames = Array.isArray(row.files)
+      ? row.files.map((f) => f && f.name).filter(Boolean).join(", ")
+      : "";
+    const canSelect = reason === "expired" || reason === "new";
+    const countCell =
+      fileCount > 1
+        ? `<span class="g2a-tag" title="${osrEscapeAttr(fileNames)}">${fileCount} 个</span>`
+        : `<span class="g2a-muted" title="${osrEscapeAttr(fileNames)}">1 个</span>`;
+    tr.innerHTML =
+      `<td><input type="checkbox" class="osr-check" data-email="${osrEscapeAttr(email)}" ${canSelect ? "" : "disabled"} /></td>` +
+      `<td>${osrEscapeHtml(email || "—")}</td>` +
+      `<td>${countCell}</td>` +
+      `<td>${osrEscapeHtml(reasonLabel)}</td>` +
+      `<td>${row.has_sso ? "✓" : "—"}</td>` +
+      `<td>${row.has_password ? "✓" : "—"}</td>`;
+    tbody.appendChild(tr);
+  });
+  osrUpdateSelectInfo();
+  tbody.querySelectorAll("input.osr-check").forEach((el) => {
+    el.addEventListener("change", osrUpdateSelectInfo);
+  });
+}
+
+async function osrScan() {
+  const r = await api("/accounts/origin-sso/scan");
+  osrFiles = Array.isArray(r.files) ? r.files : [];
+  osrCandidates = osrFiles.slice();
+  const sum = $("osr-summary");
+  if (sum) {
+    sum.textContent =
+      `目录 ${r.origin_sso_dir || "data/origin_sso"} · 共 ${r.count || osrFiles.length} 个 JSON` +
+      (r.errors && r.errors.length ? ` · 解析错误 ${r.errors.length}` : "");
+  }
+  try {
+    await osrPreview({ silent: true });
+  } catch (_) {
+    osrRenderTable(osrFiles.map((f) => Object.assign({}, f, { reason: "new" })));
+  }
+  toast(r.message || `扫描完成：${r.count || 0} 个文件`);
+  return r;
+}
+
+async function osrPreview(opts) {
+  opts = opts || {};
+  const filter_mode = ($("osr-filter-mode") && $("osr-filter-mode").value) || "expired_and_new";
+  const r = await api("/accounts/origin-sso/preview", {
+    method: "POST",
+    body: JSON.stringify({ filter_mode }),
+  });
+  osrCandidates = Array.isArray(r.candidates) ? r.candidates.slice() : [];
+  const rows = osrCandidates.concat(Array.isArray(r.skipped) ? r.skipped : []);
+  osrRenderTable(rows);
+  const sum = $("osr-summary");
+  if (sum) {
+    sum.innerHTML =
+      `候选 <b>${r.candidate_count || 0}</b> · 过期 ${r.expired_count || 0} · 新账号 ${r.new_count || 0} · 跳过活跃 ${r.skipped_count || 0}` +
+      (r.origin_sso_dir
+        ? `<br/><span class="g2a-muted">${osrEscapeHtml(r.origin_sso_dir)}</span>`
+        : "");
+  }
+  osrUpdateSelectInfo();
+  if (!opts.silent) toast(r.message || `预览完成：候选 ${r.candidate_count || 0}`);
+  return r;
+}
+
+function osrStopPolling() {
+  try { clearInterval(osrPollTimer); } catch (_) {}
+  try { clearTimeout(osrPollTimer); } catch (_) {}
+  osrPollTimer = null;
+}
+
+function osrStartPolling() {
+  osrStopPolling();
+  const tick = async () => {
+    if (osrPollInFlight || !osrBatchId) return;
+    osrPollInFlight = true;
+    try {
+      await osrRefreshProgress({ silent: true });
+    } catch (_) {
+    } finally {
+      osrPollInFlight = false;
+    }
+  };
+  osrPollTimer = setInterval(tick, 800);
+  tick();
+}
+
+function osrFormatBatchLog(b) {
+  const lines = [];
+  lines.push("======== Origin SSO 恢复进度 ========");
+  lines.push(`batch_id: ${b.id || osrBatchId || "—"}`);
+  lines.push(`status: ${b.status || "—"} · ${b.message || ""}`);
+  lines.push(
+    `进度: ${b.done || 0}/${b.total || 0}  成功 ${b.success || 0}  失败 ${b.fail || 0}  跳过 ${b.skipped || 0}`
+  );
+  lines.push(`percent: ${b.percent != null ? b.percent : 0}%`);
+  lines.push("-------- sessions --------");
+  const sessions = Array.isArray(b.sessions) ? b.sessions : [];
+  sessions.slice(0, 80).forEach((s) => {
+    lines.push(`[${s.status || "?"}] ${s.email || s.id || "?"} · ${s.message || ""}`);
+    const logs = Array.isArray(s.log_lines) ? s.log_lines : [];
+    logs.slice(-6).forEach((ln) => lines.push("    " + ln));
+  });
+  if (sessions.length > 80) lines.push(`… 另有 ${sessions.length - 80} 个 session 未展开`);
+  return lines.join("\n");
+}
+
+async function osrRefreshProgress(opts) {
+  opts = opts || {};
+  if (!osrBatchId) {
+    if (!opts.silent) toast("当前没有进行中的 Origin SSO 批次", false);
+    return null;
+  }
+  const b = await api("/accounts/origin-sso/batches/" + encodeURIComponent(osrBatchId));
+  osrShowBox(true);
+  const pct =
+    b.percent != null
+      ? b.percent
+      : b.total
+        ? Math.round(((b.done || 0) * 100) / b.total)
+        : 0;
+  osrSetProgress(pct, b.message || `${b.done || 0}/${b.total || 0}`, b.status || "—");
+  osrSetLog(osrFormatBatchLog(b));
+  const terminal = ["done", "partial", "error", "cancelled"].includes(
+    String(b.status || "").toLowerCase()
+  );
+  if (terminal) {
+    osrStopPolling();
+    osrClearTrack();
+    if (!opts.silent) toast(b.message || "批次已结束", b.ok !== false);
+    try { await loadDashboard(); } catch (_) {}
+  }
+  return b;
+}
+
+async function osrStart() {
+  const filter_mode = ($("osr-filter-mode") && $("osr-filter-mode").value) || "expired_and_new";
+  const concurrency = Number(($("osr-concurrency") && $("osr-concurrency").value) || 3) || 3;
+  const captcha_provider = ($("osr-captcha") && $("osr-captcha").value) || "local";
+  const selected = osrSelectedEmails();
+  let preview;
+  try {
+    preview = await osrPreview({ silent: true });
+  } catch (e) {
+    toast(e.message || String(e), false);
+    return;
+  }
+  const totalCandidates = Number(preview.candidate_count || 0);
+  if (!totalCandidates && !selected.length) {
+    toast("没有可处理的账号（过期/新账号为空）", false);
+    return;
+  }
+  const processCount = selected.length || totalCandidates;
+  const scopeMsg = selected.length
+    ? `将处理勾选的 ${selected.length} 个邮箱账号`
+    : `未勾选任何账号，将处理全部候选（${totalCandidates} 个邮箱：过期 ${preview.expired_count || 0} + 新账号 ${preview.new_count || 0}）`;
+  if (!confirm(scopeMsg + "\n\n确认后立即开始 Origin SSO 恢复？")) {
+    return;
+  }
+  const body = { filter_mode, concurrency, captcha_provider };
+  if (selected.length) body.selected_emails = selected;
+  const btn = $("btn-osr-start");
+  if (btn) btn.disabled = true;
+  try {
+    const r = await api("/accounts/origin-sso/start", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    osrBatchId = r.batch_id || null;
+    osrSaveTrack();
+    osrShowBox(true);
+    osrSetProgress(0, r.message || "已启动", r.status || "queued");
+    osrSetLog(
+      [
+        "[start] Origin SSO 恢复已启动",
+        `batch_id: ${osrBatchId || "—"}`,
+        `total: ${r.total || processCount}`,
+        `expired: ${r.expired_count || 0} · new: ${r.new_count || 0}`,
+        `concurrency: ${r.concurrency || concurrency}`,
+        `captcha: ${captcha_provider}`,
+        selected.length
+          ? `selected_emails: ${selected.length}`
+          : "selected_emails: (全部候选)",
+      ].join("\n")
+    );
+    toast(r.message || `已启动 · ${r.total || processCount} 个账号`);
+    osrStartPolling();
+  } catch (e) {
+    toast(e.message || String(e), false);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function osrStop() {
+  if (!osrBatchId) {
+    toast("没有可停止的批次", false);
+    return;
+  }
+  if (!confirm("确认停止当前 Origin SSO 批次？")) return;
+  try {
+    const r = await api(
+      "/accounts/origin-sso/batches/" + encodeURIComponent(osrBatchId) + "/stop",
+      { method: "POST", body: "{}" }
+    );
+    toast(r.message || "已请求停止");
+    await osrRefreshProgress({ silent: true });
+  } catch (e) {
+    toast(e.message || String(e), false);
+  }
+}
+
+function bindOriginSsoControls() {
+  if ($("btn-osr-scan"))
+    on("btn-osr-scan", "onclick", () => {
+      osrScan().catch((e) => toast(e.message, false));
+    });
+  if ($("btn-osr-preview"))
+    on("btn-osr-preview", "onclick", () => {
+      osrPreview().catch((e) => toast(e.message, false));
+    });
+  if ($("btn-osr-start"))
+    on("btn-osr-start", "onclick", () => {
+      osrStart().catch((e) => toast(e.message, false));
+    });
+  if ($("btn-osr-stop"))
+    on("btn-osr-stop", "onclick", () => {
+      osrStop().catch((e) => toast(e.message, false));
+    });
+  if ($("btn-osr-refresh"))
+    on("btn-osr-refresh", "onclick", () => {
+      osrRefreshProgress().catch((e) => toast(e.message, false));
+    });
+  if ($("btn-osr-select-all"))
+    on("btn-osr-select-all", "onclick", () => {
+      document
+        .querySelectorAll("#osr-tbody input.osr-check:not(:disabled)")
+        .forEach((el) => {
+          el.checked = true;
+        });
+      osrUpdateSelectInfo();
+    });
+  if ($("btn-osr-select-none"))
+    on("btn-osr-select-none", "onclick", () => {
+      document.querySelectorAll("#osr-tbody input.osr-check").forEach((el) => {
+        el.checked = false;
+      });
+      osrUpdateSelectInfo();
+    });
+  if ($("osr-check-all"))
+    on("osr-check-all", "onchange", (e) => {
+      const onn = !!(e && e.target && e.target.checked);
+      document
+        .querySelectorAll("#osr-tbody input.osr-check:not(:disabled)")
+        .forEach((el) => {
+          el.checked = onn;
+        });
+      osrUpdateSelectInfo();
+    });
+  // Re-attach to an in-flight/finished batch after page refresh or soft-nav.
+  if (!osrBatchId) {
+    osrRestoreTracked().catch(() => {});
+  }
+}
+
 })();
 /* g2a-cache-bust-20260715-reg-restore-fix */
+
+

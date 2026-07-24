@@ -383,7 +383,7 @@ def poll_token(
     return None
 
 
-def sso_to_token(sso_cookie: str, *, quiet: bool = False) -> dict | None:
+def sso_to_token(sso_cookie: str, *, quiet: bool = False, detail: dict | None = None) -> dict | None:
     """SSO cookie → token dict (access/refresh/expires_in).
 
     ``quiet=True`` reduces per-account stdout (faster under high concurrency).
@@ -407,11 +407,19 @@ def sso_to_token(sso_cookie: str, *, quiet: bool = False) -> dict | None:
         )
     except Exception as e:
         log(f"  ❌ 网络错误: {e}")
+        if isinstance(detail, dict):
+            detail["reason"] = "network_error"
         return None
     if "sign-in" in r.url or "sign-up" in r.url:
         log("  ❌ sso 无效")
+        if isinstance(detail, dict):
+            detail["reason"] = "sso_invalid"
+            detail["sso_valid"] = False
         return None
     log("  ✅ sso 有效")
+    if isinstance(detail, dict):
+        detail.setdefault("reason", "device_flow_failed")
+        detail["sso_valid"] = True
 
     retries = _device_flow_retries()
     for attempt in range(1, retries + 1):

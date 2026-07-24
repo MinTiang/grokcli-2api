@@ -11532,6 +11532,70 @@ let osrPollTimer = null;
 let osrPollInFlight = false;
 let osrCandidates = [];
 let osrFiles = [];
+const OSR_TRACK_KEY = "g2a_osr_track_v1";
+
+function osrSaveTrack() {
+  try {
+    if (!osrBatchId) {
+      sessionStorage.removeItem(OSR_TRACK_KEY);
+      return;
+    }
+    sessionStorage.setItem(
+      OSR_TRACK_KEY,
+      JSON.stringify({ batch_id: osrBatchId, saved_at: Date.now() })
+    );
+  } catch (_) {}
+}
+
+function osrClearTrack() {
+  try { sessionStorage.removeItem(OSR_TRACK_KEY); } catch (_) {}
+}
+
+function osrLoadTrack() {
+  try {
+    const raw = sessionStorage.getItem(OSR_TRACK_KEY);
+    if (!raw) return null;
+    const obj = JSON.parse(raw);
+    if (!obj || !obj.batch_id) return null;
+    // Drop stale tracks (> 12h).
+    if (Date.now() - Number(obj.saved_at || 0) > 12 * 3600 * 1000) {
+      osrClearTrack();
+      return null;
+    }
+    return obj;
+  } catch (_) {
+    return null;
+  }
+}
+
+// Re-attach to an in-flight/finished batch after a page refresh or soft-nav.
+async function osrRestoreTracked() {
+  const track = osrLoadTrack();
+  if (!track || !track.batch_id) return false;
+  osrBatchId = track.batch_id;
+  try {
+    const b = await api("/accounts/origin-sso/batches/" + encodeURIComponent(osrBatchId));
+    osrShowBox(true);
+    const pct =
+      b.percent != null ? b.percent : (b.total ? Math.round(((b.done || 0) * 100) / b.total) : 0);
+    osrSetProgress(pct, b.message || `${b.done || 0}/${b.total || 0}`, b.status || "—");
+    osrSetLog(osrFormatBatchLog(b));
+    const terminal = ["done", "partial", "error", "cancelled"].includes(
+      String(b.status || "").toLowerCase()
+    );
+    if (terminal) {
+      osrClearTrack();
+    } else {
+      osrStartPolling();
+    }
+    return true;
+  } catch (e) {
+    // Batch not found (server restarted / pruned) — drop the stale track.
+    osrClearTrack();
+    osrBatchId = null;
+    return false;
+  }
+}
 
 function osrShowBox(show) {
   const box = $("osr-session-box");
@@ -11733,6 +11797,7 @@ async function osrRefreshProgress(opts) {
   );
   if (terminal) {
     osrStopPolling();
+    osrClearTrack();
     if (!opts.silent) toast(b.message || "批次已结束", b.ok !== false);
     try { await loadDashboard(); } catch (_) {}
   }
@@ -11773,6 +11838,7 @@ async function osrStart() {
       body: JSON.stringify(body),
     });
     osrBatchId = r.batch_id || null;
+    osrSaveTrack();
     osrShowBox(true);
     osrSetProgress(0, r.message || "已启动", r.status || "queued");
     osrSetLog(
@@ -11862,6 +11928,10 @@ function bindOriginSsoControls() {
         });
       osrUpdateSelectInfo();
     });
+  // Re-attach to an in-flight/finished batch after page refresh or soft-nav.
+  if (!osrBatchId) {
+    osrRestoreTracked().catch(() => {});
+  }
 }
 
 })();

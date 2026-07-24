@@ -520,16 +520,56 @@ def _delete_origin_file(path: Path, sess_id: str, email: str) -> None:
     _update_session(sess_id, "deleted_bad_json", f"密码错误，已删除 {path.name}")
 
 
+def _write_back_sso(path: Path, sso_cookie: str, sess_id: str, email: str) -> bool:
+    """Write a freshly obtained SSO back into its origin json + updated_at.
+
+    Called right after password reauth yields a new SSO, BEFORE the (rate-limit
+    prone) device-flow token conversion. Guarantees the new SSO is never lost:
+    a later rerun picks it up directly from the json and skips password+turnstile.
+    """
+    try:
+        data: dict[str, Any] = {}
+        if path.is_file():
+            try:
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    data = loaded
+            except Exception:
+                data = {}
+        data["sso"] = sso_cookie
+        data["sso_cookie"] = sso_cookie
+        data["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(path)
+        _update_session(sess_id, "sso_written_back", f"新 SSO 已写回 {path.name}")
+        return True
+    except Exception as e:  # noqa: BLE001
+        _update_session(sess_id, "sso_writeback_failed", f"写回 SSO 失败: {str(e)[:120]}")
+        return False
+
+
 def _import_sso_entry(
     *, sess_id: str, email: str, sso_cookie: str, password: str, source: str, origin_name: str
 ) -> dict[str, Any]:
-    """SSO cookie → token → import into account pool. Returns import result-ish."""
+    """SSO cookie -> token -> import into account pool.
+
+    Returns import result plus ``sso_reason`` classifying any sso_to_token
+    failure (sso_invalid / device_flow_failed / network_error) so the caller
+    can decide whether to fall back to password reauth.
+    """
     import scripts.sso_to_auth_json as sso_conv
     from grok2api.pool import accounts
 
-    token = sso_conv.sso_to_token(sso_cookie, quiet=True)
+    detail: dict[str, Any] = {}
+    token = sso_conv.sso_to_token(sso_cookie, quiet=True, detail=detail)
     if not isinstance(token, dict) or not (token.get("access_token") or token.get("key")):
-        return {"ok": False, "error": "sso_conversion_failed"}
+        return {
+            "ok": False,
+            "error": "sso_conversion_failed",
+            "sso_reason": str(detail.get("reason") or "device_flow_failed"),
+            "sso_valid": bool(detail.get("sso_valid")),
+        }
     _key, entry = sso_conv.token_to_auth_entry(token, email=email)
     entry = dict(entry or {})
     entry["sso"] = sso_cookie
@@ -551,8 +591,8 @@ def _try_one_file(
 
     Returns dict with keys:
       ok (bool), method ("sso"|"password"|None), error (str|None),
-      wrong_password (bool) — True only when CreateSession said invalid-credentials,
-      transient (bool) — non-fatal failure that should NOT delete the json.
+      wrong_password (bool) - True only when CreateSession said invalid-credentials,
+      transient (bool) - non-fatal failure that should NOT delete the json.
     """
     path_s = str(file_info.get("path") or "").strip()
     if not path_s:
@@ -560,7 +600,6 @@ def _try_one_file(
     path = Path(path_s)
     data = _read_origin_json(path)
     if not data:
-        # Unreadable / malformed / missing email: not a wrong-password case.
         return {"ok": False, "error": "bad json", "wrong_password": False, "transient": True}
 
     email = str(data.get("email") or "").strip()
@@ -569,7 +608,7 @@ def _try_one_file(
         data.get("sso") or data.get("sso_cookie") or data.get("sso_token") or ""
     ).strip()
 
-    # ── Step 1: try existing SSO cookie ──────────────────────────────────
+    # -- Step 1: try existing SSO cookie ----------------------------------
     if sso_cookie:
         _update_session(sid, "trying_sso", f"尝试现有 SSO · {email} · {path.name}")
         try:
@@ -588,19 +627,35 @@ def _try_one_file(
                 )
                 return {"ok": True, "method": "sso", "error": None,
                         "wrong_password": False, "transient": False}
+            reason = str(result.get("sso_reason") or "")
             if result.get("error") == "sso_conversion_failed":
-                _update_session(sid, "sso_invalid", "SSO 无效/过期，准备账密回退")
+                if reason == "sso_invalid":
+                    # SSO truly dead (redirected to sign-in) -> fall back to password.
+                    _update_session(sid, "sso_invalid", "SSO 已失效，转账密回退")
+                else:
+                    # SSO likely still good; device-flow/rate-limit/network failed.
+                    # Do NOT burn password+turnstile - keep json, retry later.
+                    _update_session(
+                        sid, "sso_device_flow_failed",
+                        f"SSO 有效但换 token 失败({reason or 'device_flow'})；保留文件稍后重试",
+                    )
+                    return {"ok": False, "error": f"sso_{reason or 'device_flow_failed'}",
+                            "wrong_password": False, "transient": True}
             else:
                 _update_session(
                     sid, "sso_import_failed",
                     f"SSO 有效但入库失败: {str(result.get('error'))[:160]}",
                 )
+                return {"ok": False, "error": str(result.get("error") or "import_failed"),
+                        "wrong_password": False, "transient": True}
         except Exception as e:  # noqa: BLE001
             _update_session(sid, "sso_failed", f"SSO 转换异常: {str(e)[:160]}")
+            return {"ok": False, "error": str(e)[:160],
+                    "wrong_password": False, "transient": True}
     else:
         _update_session(sid, "no_sso", f"{path.name} 无 SSO，走账密")
 
-    # ── Step 2: password → new SSO ───────────────────────────────────────
+    # -- Step 2: password -> new SSO --------------------------------------
     if not password:
         return {"ok": False, "error": "no password for fallback",
                 "wrong_password": False, "transient": True}
@@ -612,7 +667,6 @@ def _try_one_file(
         )
     except Exception as e:  # noqa: BLE001
         _update_session(sid, "password_error", f"账密换 SSO 异常: {str(e)[:200]}")
-        # Turnstile / solver / network exception — transient, keep the json.
         return {"ok": False, "error": str(e)[:200],
                 "wrong_password": False, "transient": True}
 
@@ -625,7 +679,6 @@ def _try_one_file(
             )
             return {"ok": False, "error": "wrong_password",
                     "wrong_password": True, "transient": False}
-        # transient: rate limit / propagating / turnstile — keep json, don't switch.
         _update_session(
             sid, "password_failed",
             f"账密换 SSO 失败(非密码错误): grpc={detail.get('grpc_status')} "
@@ -634,7 +687,11 @@ def _try_one_file(
         return {"ok": False, "error": f"reauth_failed:{detail.get('grpc_msg') or 'empty'}",
                 "wrong_password": False, "transient": True}
 
-    _update_session(sid, "converting", "新 SSO 已拿到，转换 token 并入库")
+    # New SSO obtained -> write it back to the json IMMEDIATELY (before the
+    # rate-limit-prone token conversion) so it is never lost on failure.
+    _write_back_sso(path, new_sso, sid, email)
+
+    _update_session(sid, "converting", "新 SSO 已拿到并写回，转换 token 并入库")
     try:
         result = _import_sso_entry(
             sess_id=sid,
@@ -652,7 +709,10 @@ def _try_one_file(
             return {"ok": True, "method": "password", "error": None,
                     "wrong_password": False, "transient": False}
         err = str(result.get("error") or "import failed")
-        _update_session(sid, "import_failed", f"入库失败: {err[:160]}")
+        _update_session(
+            sid, "import_failed",
+            f"新 SSO 已写回但换 token/入库失败: {err[:140]}（可重跑直接用新 SSO）",
+        )
         return {"ok": False, "error": err, "wrong_password": False, "transient": True}
     except Exception as e:  # noqa: BLE001
         _update_session(sid, "import_error", f"转换/入库异常: {str(e)[:200]}")
