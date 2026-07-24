@@ -173,6 +173,13 @@
           <span class="g2a-subnav-desc">批量导入 SSO</span>
         </span>
       </button>
+      <button type="button" class="g2a-subnav-item" data-section="origin-sso" aria-controls="panel-origin-sso">
+        <span class="g2a-subnav-ico">♻</span>
+        <span class="g2a-subnav-text">
+          <span class="g2a-subnav-title">Origin SSO 恢复</span>
+          <span class="g2a-subnav-desc">data/origin_sso 账密/SSO 恢复</span>
+        </span>
+      </button>
       <button type="button" class="g2a-subnav-item" data-section="io" aria-controls="panel-io">
         <span class="g2a-subnav-ico">⇌</span>
         <span class="g2a-subnav-text">
@@ -554,6 +561,89 @@
 </section>
     </div>
 
+
+    <div class="g2a-subpanel" data-section="origin-sso" id="panel-origin-sso" hidden>
+<section id="sec-origin-sso" class="g2a-card">
+  <div class="g2a-card-head">
+    <div>
+      <h3>Origin SSO 恢复</h3>
+      <p>扫描 <code>data/origin_sso/*.json</code>，对<strong>已过期</strong>与<strong>池中不存在</strong>的账号恢复/导入。优先用 JSON 内 SSO；失效则账密换新 SSO（需过盾）。不勾选 = 处理全部候选。</p>
+    </div>
+    <div class="g2a-actions">
+      <button class="g2a-btn g2a-btn-default" id="btn-osr-scan">扫描目录</button>
+      <button class="g2a-btn g2a-btn-default" id="btn-osr-preview">预览匹配</button>
+      <button class="g2a-btn g2a-btn-primary" id="btn-osr-start">开始恢复</button>
+      <button class="g2a-btn g2a-btn-danger" id="btn-osr-stop" title="停止当前批次">停止</button>
+      <button class="g2a-btn g2a-btn-default" id="btn-osr-refresh">刷新进度</button>
+    </div>
+  </div>
+  <div class="g2a-form-grid">
+    <div class="g2a-field">
+      <label for="osr-filter-mode">处理范围</label>
+      <select id="osr-filter-mode">
+        <option value="expired_and_new" selected>过期 + 新账号</option>
+        <option value="expired_only">仅过期</option>
+        <option value="new_only">仅新账号</option>
+      </select>
+    </div>
+    <div class="g2a-field">
+      <label for="osr-concurrency">并发</label>
+      <input id="osr-concurrency" type="number" min="1" max="10" value="3" />
+    </div>
+    <div class="g2a-field">
+      <label for="osr-captcha">过盾（账密回退时）</label>
+      <select id="osr-captcha">
+        <option value="local" selected>本地过盾</option>
+        <option value="yescaptcha">YesCaptcha</option>
+      </select>
+    </div>
+    <div class="g2a-field" style="grid-column:1/-1">
+      <div id="osr-summary" class="g2a-muted">尚未扫描。点击「扫描目录」加载 origin_sso 文件列表。</div>
+    </div>
+  </div>
+  <div class="g2a-toolbar" style="margin-top:8px">
+    <button class="g2a-btn g2a-btn-default" id="btn-osr-select-all" type="button">全选候选</button>
+    <button class="g2a-btn g2a-btn-default" id="btn-osr-select-none" type="button">取消选择</button>
+    <span class="g2a-spacer"></span>
+    <span id="osr-select-info" class="g2a-muted">—</span>
+  </div>
+  <div class="g2a-table-wrap" style="margin-top:8px;max-height:320px;overflow:auto">
+    <table class="g2a-table">
+      <thead>
+        <tr>
+          <th><input type="checkbox" id="osr-check-all" /></th>
+          <th>邮箱</th>
+          <th>文件</th>
+          <th>状态</th>
+          <th>SSO</th>
+          <th>密码</th>
+        </tr>
+      </thead>
+      <tbody id="osr-tbody"></tbody>
+    </table>
+  </div>
+  <div id="osr-session-box" class="g2a-subcard hidden" style="margin-top:12px" hidden>
+    <div class="g2a-card-head">
+      <div>
+        <h3>恢复进度</h3>
+        <p id="osr-progress-meta" class="g2a-muted">—</p>
+      </div>
+      <span id="osr-status" class="g2a-tag">—</span>
+    </div>
+    <div class="g2a-sso-progress" style="margin:8px 0">
+      <div class="g2a-sso-progress-meta">
+        <span id="osr-progress-label" class="g2a-muted">准备中…</span>
+        <span id="osr-progress-pct" class="g2a-muted">0%</span>
+      </div>
+      <div class="g2a-sso-progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+        <div id="osr-progress-fill" class="g2a-sso-progress-fill" style="width:0%"></div>
+      </div>
+    </div>
+    <pre id="osr-log" class="g2a-log is-empty hidden" hidden>—</pre>
+  </div>
+</section>
+    </div>
+
     <div class="g2a-subpanel" data-section="io" id="panel-io" hidden>
 <section id="sec-json-io" class="g2a-card">
   <div class="g2a-card-head">
@@ -604,6 +694,6 @@
   <script src="/static/dist/api.443dfc63c0.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/state.5846ce62e4.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
   <script src="/static/dist/auth.539061a1a7.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
-  <script src="/static/dist/core.cfc11b8162.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
+  <script src="/static/dist/core.833d51ae12.js" onerror="window.__g2aScriptFailed&&__g2aScriptFailed(this)"></script>
 </body>
 </html>

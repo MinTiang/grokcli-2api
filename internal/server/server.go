@@ -437,6 +437,27 @@ func NewMux(options Options) http.Handler {
 	mux.HandleFunc("POST /admin/api/accounts/register-email/export-sso", func(w http.ResponseWriter, r *http.Request) {
 		serveExportRegistrationSSO(w, r, options)
 	})
+	mux.HandleFunc("GET /admin/api/accounts/origin-sso/scan", func(w http.ResponseWriter, r *http.Request) {
+		serveOriginSSOScan(w, r, options)
+	})
+	mux.HandleFunc("POST /admin/api/accounts/origin-sso/preview", func(w http.ResponseWriter, r *http.Request) {
+		serveOriginSSOPreview(w, r, options)
+	})
+	mux.HandleFunc("POST /admin/api/accounts/origin-sso/start", func(w http.ResponseWriter, r *http.Request) {
+		serveOriginSSOStart(w, r, options)
+	})
+	mux.HandleFunc("GET /admin/api/accounts/origin-sso/batches/{batch_id}", func(w http.ResponseWriter, r *http.Request) {
+		serveOriginSSOBatch(w, r, options)
+	})
+	mux.HandleFunc("POST /admin/api/accounts/origin-sso/batches/{batch_id}/stop", func(w http.ResponseWriter, r *http.Request) {
+		serveOriginSSOStopBatch(w, r, options)
+	})
+	mux.HandleFunc("GET /admin/api/accounts/origin-sso/sessions", func(w http.ResponseWriter, r *http.Request) {
+		serveOriginSSOSessions(w, r, options)
+	})
+	mux.HandleFunc("GET /admin/api/accounts/origin-sso/sessions/{session_id}", func(w http.ResponseWriter, r *http.Request) {
+		serveOriginSSOSession(w, r, options)
+	})
 	mux.HandleFunc("POST /admin/api/accounts/import-sso", func(w http.ResponseWriter, r *http.Request) {
 		serveSSOImportStart(w, r, options)
 	})
@@ -6134,6 +6155,185 @@ func serveRegistrationStart(w http.ResponseWriter, r *http.Request, options Opti
 		idem = strings.TrimSpace(stringValue(body["idempotency_key"]))
 	}
 	payload, err := client.Start(r.Context(), body, idem)
+	if err != nil {
+		writeRegistrationError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, payload)
+}
+
+// ── Origin SSO recovery (data/origin_sso/*.json) ─────────────────────────────
+
+func serveOriginSSOScan(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, false) {
+		return
+	}
+	client := registrationClient(options)
+	if client == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "registration service URL is not configured"})
+		return
+	}
+	payload, err := client.OriginSSOScan(r.Context())
+	if err != nil {
+		writeRegistrationError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, payload)
+}
+
+func serveOriginSSOPreview(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, false) {
+		return
+	}
+	client := registrationClient(options)
+	if client == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "registration service URL is not configured"})
+		return
+	}
+	var body map[string]any
+	decoder := json.NewDecoder(r.Body)
+	decoder.UseNumber()
+	if err := decoder.Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+		return
+	}
+	if body == nil {
+		body = map[string]any{}
+	}
+	payload, err := client.OriginSSOPreview(r.Context(), body)
+	if err != nil {
+		writeRegistrationError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, payload)
+}
+
+func serveOriginSSOStart(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, true) {
+		return
+	}
+	client := registrationClient(options)
+	if client == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "registration service URL is not configured"})
+		return
+	}
+	var body map[string]any
+	decoder := json.NewDecoder(r.Body)
+	decoder.UseNumber()
+	if err := decoder.Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": err.Error()})
+		return
+	}
+	if body == nil {
+		body = map[string]any{}
+	}
+	// Inherit captcha secrets from registration_config when form leaves them blank.
+	merged := mergeRegistrationStartBody(r.Context(), options, body)
+	if _, ok := body["captcha_provider"]; !ok {
+		if v := stringValue(merged["captcha_provider"]); v != "" {
+			body["captcha_provider"] = v
+		}
+	}
+	if _, ok := body["yescaptcha_key"]; !ok {
+		if v := stringValue(merged["yescaptcha_key"]); v != "" {
+			body["yescaptcha_key"] = v
+		}
+	}
+	if _, ok := body["local_solver_url"]; !ok {
+		if v := stringValue(merged["local_solver_url"]); v != "" {
+			body["local_solver_url"] = v
+		}
+	}
+	if _, ok := body["proxy"]; !ok {
+		if v := stringValue(merged["proxy"]); v != "" {
+			body["proxy"] = v
+		}
+	}
+	payload, err := client.OriginSSOStart(r.Context(), body)
+	if err != nil {
+		writeRegistrationError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, payload)
+}
+
+func serveOriginSSOBatch(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, false) {
+		return
+	}
+	client := registrationClient(options)
+	if client == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "registration service URL is not configured"})
+		return
+	}
+	batchID := strings.TrimSpace(r.PathValue("batch_id"))
+	if batchID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "batch_id required"})
+		return
+	}
+	payload, err := client.OriginSSOBatch(r.Context(), batchID)
+	if err != nil {
+		writeRegistrationError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, payload)
+}
+
+func serveOriginSSOStopBatch(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, true) {
+		return
+	}
+	client := registrationClient(options)
+	if client == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "registration service URL is not configured"})
+		return
+	}
+	batchID := strings.TrimSpace(r.PathValue("batch_id"))
+	if batchID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "batch_id required"})
+		return
+	}
+	payload, err := client.OriginSSOStopBatch(r.Context(), batchID)
+	if err != nil {
+		writeRegistrationError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, payload)
+}
+
+func serveOriginSSOSessions(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, false) {
+		return
+	}
+	client := registrationClient(options)
+	if client == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "registration service URL is not configured"})
+		return
+	}
+	batchID := strings.TrimSpace(r.URL.Query().Get("batch_id"))
+	payload, err := client.OriginSSOSessions(r.Context(), batchID)
+	if err != nil {
+		writeRegistrationError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, payload)
+}
+
+func serveOriginSSOSession(w http.ResponseWriter, r *http.Request, options Options) {
+	if !requireAdminReadWrite(w, r, options, false) {
+		return
+	}
+	client := registrationClient(options)
+	if client == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"detail": "registration service URL is not configured"})
+		return
+	}
+	sessionID := strings.TrimSpace(r.PathValue("session_id"))
+	if sessionID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"detail": "session_id required"})
+		return
+	}
+	payload, err := client.OriginSSOSession(r.Context(), sessionID)
 	if err != nil {
 		writeRegistrationError(w, err)
 		return

@@ -828,6 +828,133 @@ def sso_import_job(job_id: str, request: Request) -> dict[str, Any]:
     return ar._sso_public_job(job)
 
 
+# ---------------------------------------------------------------------------
+# Origin SSO recovery (data/origin_sso/*.json → reauth / import)
+# ---------------------------------------------------------------------------
+ORIGIN_SSO_PREFIX = "/internal/origin-sso/v1"
+
+
+def _origin_sso():
+    try:
+        from grok2api.upstream import origin_sso_recover as osr
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=503, detail=f"origin sso recovery unavailable: {exc}"
+        ) from exc
+    return osr
+
+
+@app.get(f"{ORIGIN_SSO_PREFIX}/scan")
+def origin_sso_scan(request: Request) -> dict[str, Any]:
+    """List JSON files under data/origin_sso/."""
+    _require_auth(request)
+    return _jsonable(_origin_sso().scan_origin_sso_files())
+
+
+@app.post(f"{ORIGIN_SSO_PREFIX}/preview")
+async def origin_sso_preview(request: Request) -> dict[str, Any]:
+    """Dry-run: classify origin files against the account pool."""
+    _require_auth(request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    selected = body.get("selected_files") or body.get("files") or None
+    if isinstance(selected, str):
+        selected = [selected]
+    if selected is not None and not isinstance(selected, list):
+        selected = None
+    emails = body.get("selected_emails") or body.get("emails") or None
+    if isinstance(emails, str):
+        emails = [emails]
+    if emails is not None and not isinstance(emails, list):
+        emails = None
+    filter_mode = str(body.get("filter_mode") or "expired_and_new").strip()
+    return _jsonable(
+        _origin_sso().preview_origin_sso(
+            filter_mode=filter_mode,
+            selected_emails=emails,
+            selected_files=selected,
+        )
+    )
+
+
+@app.post(f"{ORIGIN_SSO_PREFIX}/start")
+async def origin_sso_start(request: Request) -> dict[str, Any]:
+    """Start origin SSO recovery batch (async, poll /batches/{id})."""
+    _require_auth(request)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    selected = body.get("selected_files") or body.get("files") or None
+    if isinstance(selected, str):
+        selected = [selected]
+    if selected is not None and not isinstance(selected, list):
+        selected = None
+    emails = body.get("selected_emails") or body.get("emails") or None
+    if isinstance(emails, str):
+        emails = [emails]
+    if emails is not None and not isinstance(emails, list):
+        emails = None
+    try:
+        concurrency = int(body.get("concurrency") or 3)
+    except Exception:
+        concurrency = 3
+    result = _origin_sso().start_origin_sso_recovery(
+        filter_mode=str(body.get("filter_mode") or "expired_and_new").strip(),
+        concurrency=concurrency,
+        selected_emails=emails,
+        selected_files=selected,
+        captcha_provider=body.get("captcha_provider"),
+        yescaptcha_key=body.get("yescaptcha_key"),
+        local_solver_url=body.get("local_solver_url"),
+        proxy=body.get("proxy"),
+    )
+    if not isinstance(result, dict):
+        raise HTTPException(status_code=500, detail="invalid origin-sso response")
+    if result.get("ok") is False:
+        raise HTTPException(
+            status_code=400, detail=str(result.get("error") or "origin sso start failed")
+        )
+    return _jsonable(result)
+
+
+@app.get(f"{ORIGIN_SSO_PREFIX}/batches/{{batch_id}}")
+def origin_sso_batch(batch_id: str, request: Request) -> dict[str, Any]:
+    _require_auth(request)
+    batch = _origin_sso().get_batch(batch_id)
+    if not batch:
+        raise HTTPException(status_code=404, detail="origin sso batch not found")
+    return _jsonable(batch)
+
+
+@app.post(f"{ORIGIN_SSO_PREFIX}/batches/{{batch_id}}/stop")
+def origin_sso_stop_batch(batch_id: str, request: Request) -> dict[str, Any]:
+    _require_auth(request)
+    return _jsonable(_origin_sso().stop_batch(batch_id))
+
+
+@app.get(f"{ORIGIN_SSO_PREFIX}/sessions")
+def origin_sso_sessions(request: Request) -> dict[str, Any]:
+    _require_auth(request)
+    batch_id = (request.query_params.get("batch_id") or "").strip() or None
+    return _jsonable(_origin_sso().list_sessions(batch_id=batch_id))
+
+
+@app.get(f"{ORIGIN_SSO_PREFIX}/sessions/{{session_id}}")
+def origin_sso_session(session_id: str, request: Request) -> dict[str, Any]:
+    _require_auth(request)
+    sess = _origin_sso().get_session(session_id)
+    if not sess:
+        raise HTTPException(status_code=404, detail="origin sso session not found")
+    return _jsonable(sess)
+
+
 @app.exception_handler(HTTPException)
 async def http_error_handler(_: Request, exc: HTTPException) -> JSONResponse:
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})

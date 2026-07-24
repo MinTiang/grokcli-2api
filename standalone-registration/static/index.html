@@ -1,0 +1,659 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>独立注册服务 · Grok</title>
+  <style>
+    :root {
+      --bg: #0a0a0f;
+      --panel: #12121a;
+      --panel2: #1a1a24;
+      --line: rgba(255,255,255,.08);
+      --text: #f4f4f5;
+      --muted: #a1a1aa;
+      --brand: #22d3ee;
+      --brand2: #a78bfa;
+      --ok: #4ade80;
+      --warn: #fbbf24;
+      --bad: #f87171;
+      --r: 12px;
+      --font: Inter, system-ui, -apple-system, sans-serif;
+      --mono: "JetBrains Mono", ui-monospace, Menlo, monospace;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; font-family: var(--font); color: var(--text);
+      background:
+        radial-gradient(900px 500px at 0% 0%, rgba(34,211,238,.08), transparent 55%),
+        radial-gradient(800px 480px at 100% 0%, rgba(167,139,250,.07), transparent 50%),
+        var(--bg);
+      min-height: 100vh;
+    }
+    .wrap { max-width: 1100px; margin: 0 auto; padding: 24px 16px 64px; }
+    header {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 12px; margin-bottom: 20px; flex-wrap: wrap;
+    }
+    header h1 { font-size: 1.25rem; margin: 0; letter-spacing: -.02em; }
+    header p { margin: 4px 0 0; color: var(--muted); font-size: .9rem; }
+    .card {
+      background: var(--panel); border: 1px solid var(--line);
+      border-radius: var(--r); padding: 18px; margin-bottom: 16px;
+      box-shadow: 0 16px 40px rgba(0,0,0,.35);
+    }
+    .card h2 { margin: 0 0 4px; font-size: 1.05rem; }
+    .card .sub { color: var(--muted); font-size: .85rem; margin: 0 0 14px; }
+    .grid {
+      display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+      gap: 12px;
+    }
+    .grid .span2 { grid-column: span 2; }
+    @media (max-width: 700px) { .grid .span2 { grid-column: span 1; } }
+    label { display: block; font-size: .8rem; color: var(--muted); margin-bottom: 4px; }
+    input, select, textarea {
+      width: 100%; background: var(--panel2); border: 1px solid var(--line);
+      border-radius: 8px; color: var(--text); padding: 9px 10px; font: inherit;
+    }
+    input:focus, select:focus, textarea:focus {
+      outline: none; border-color: rgba(34,211,238,.5);
+      box-shadow: 0 0 0 3px rgba(34,211,238,.12);
+    }
+    textarea { resize: vertical; min-height: 72px; font-family: var(--mono); font-size: .85rem; }
+    .actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+    .btn {
+      border: 1px solid var(--line); background: var(--panel2); color: var(--text);
+      border-radius: 8px; padding: 8px 14px; cursor: pointer; font: inherit;
+    }
+    .btn:hover { border-color: rgba(255,255,255,.18); }
+    .btn:disabled { opacity: .5; cursor: not-allowed; }
+    .btn-primary {
+      background: linear-gradient(135deg, #0891b2, #7c3aed);
+      border: none; color: #fff; font-weight: 600;
+    }
+    .btn-danger { background: rgba(248,113,113,.12); border-color: rgba(248,113,113,.35); color: #fecaca; }
+    .btn-ok { background: rgba(74,222,128,.12); border-color: rgba(74,222,128,.35); color: #bbf7d0; }
+    .tag {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 2px 8px; border-radius: 999px; font-size: .78rem;
+      background: rgba(255,255,255,.06); border: 1px solid var(--line);
+    }
+    .tag.ok { color: var(--ok); border-color: rgba(74,222,128,.3); }
+    .tag.warn { color: var(--warn); border-color: rgba(251,191,36,.3); }
+    .tag.bad { color: var(--bad); border-color: rgba(248,113,113,.3); }
+    .log {
+      background: #0b0b10; border: 1px solid var(--line); border-radius: 8px;
+      padding: 12px; font-family: var(--mono); font-size: .78rem;
+      max-height: 320px; overflow: auto; white-space: pre-wrap; color: #d4d4d8;
+      min-height: 80px;
+    }
+    .hidden { display: none !important; }
+    .toast {
+      position: fixed; right: 16px; bottom: 16px; z-index: 50;
+      background: var(--panel2); border: 1px solid var(--line);
+      padding: 10px 14px; border-radius: 10px; max-width: 360px;
+      box-shadow: 0 12px 32px rgba(0,0,0,.45); font-size: .9rem;
+    }
+    .toast.bad { border-color: rgba(248,113,113,.4); }
+    .login-box {
+      max-width: 380px; margin: 12vh auto; padding: 28px;
+    }
+    .kv { display: flex; justify-content: space-between; gap: 12px; margin: 6px 0; font-size: .9rem; }
+    .kv code { font-family: var(--mono); font-size: .85rem; color: var(--brand); }
+    .check { display: flex; align-items: center; gap: 8px; margin-top: 8px; color: var(--muted); font-size: .9rem; }
+    .check input { width: auto; }
+  </style>
+</head>
+<body>
+  <div id="login-view" class="wrap hidden">
+    <div class="card login-box">
+      <h2>登录独立注册服务</h2>
+      <p class="sub">使用 REG_UI_PASSWORD（或配置页保存的密码）</p>
+      <label>密码</label>
+      <input id="login-password" type="password" placeholder="UI 密码" />
+      <div class="actions">
+        <button class="btn btn-primary" id="btn-login">登录</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="app-view" class="wrap hidden">
+    <header>
+      <div>
+        <h1>独立注册服务</h1>
+        <p>协议注册 → 本地缓存 → 推送到 grokcli-2api</p>
+      </div>
+      <div class="actions" style="margin:0">
+        <span class="tag" id="health-tag">—</span>
+        <button class="btn" id="btn-logout">退出</button>
+      </div>
+    </header>
+
+    <!-- Push target -->
+    <section class="card">
+      <h2>推送目标（grokcli-2api）</h2>
+      <p class="sub">注册成功后自动调用 <code>POST /admin/api/accounts/import</code></p>
+      <div class="grid">
+        <div class="span2">
+          <label>Admin URL</label>
+          <input id="cfg-push-url" placeholder="http://your-grokcli2api:3000" />
+        </div>
+        <div>
+          <label>Admin Token</label>
+          <input id="cfg-push-token" type="password" placeholder="留空则保持原值" autocomplete="off" />
+        </div>
+        <div>
+          <label>source 标记</label>
+          <input id="cfg-push-source" placeholder="standalone-registration" />
+        </div>
+        <div class="span2">
+          <label class="check"><input type="checkbox" id="cfg-auto-push" checked /> 注册成功后自动推送</label>
+        </div>
+      </div>
+      <div class="actions">
+        <button class="btn btn-ok" id="btn-test-push">测试连通</button>
+        <button class="btn" id="btn-save-push">保存推送配置</button>
+      </div>
+    </section>
+
+    <!-- Registration -->
+    <section class="card">
+      <h2>协议注册配置</h2>
+      <p class="sub">邮箱 / 过盾 / 代理 / 并发。配置持久化到容器 <code>data/config.json</code>。</p>
+      <div class="grid">
+        <div>
+          <label>邮箱服务</label>
+          <select id="cfg-mail-provider">
+            <option value="yyds">YYDS Mail</option>
+            <option value="moemail">MoeMail</option>
+            <option value="gptmail">GPTMail</option>
+            <option value="cfmail">Cloudflare Temp Email</option>
+          </select>
+        </div>
+        <div id="wrap-base-url">
+          <label id="lbl-base-url">Base URL</label>
+          <input id="cfg-base-url" placeholder="仅 MoeMail / CFMail 需要" />
+        </div>
+        <div>
+          <label id="lbl-api-key">邮箱 API Key</label>
+          <input id="cfg-api-key" type="password" placeholder="留空则保持原值" autocomplete="off" />
+        </div>
+        <div>
+          <label id="lbl-domain">邮箱域名</label>
+          <input id="cfg-domain" placeholder="留空自动" />
+        </div>
+        <div>
+          <label>过盾方式</label>
+          <select id="cfg-captcha">
+            <option value="local">本地过盾（容器内联）</option>
+            <option value="yescaptcha">YesCaptcha</option>
+          </select>
+        </div>
+        <div id="wrap-yescaptcha" class="hidden">
+          <label>YesCaptcha Key</label>
+          <input id="cfg-yescaptcha" type="password" placeholder="留空则保持原值" autocomplete="off" />
+        </div>
+        <div>
+          <label>数量</label>
+          <input id="cfg-count" type="number" min="1" value="1" />
+        </div>
+        <div>
+          <label>并发线程</label>
+          <input id="cfg-concurrency" type="number" min="1" max="10" value="3" />
+        </div>
+        <div>
+          <label>错峰 ms</label>
+          <input id="cfg-stagger" type="number" min="0" value="300" />
+        </div>
+        <div>
+          <label>邮箱有效期</label>
+          <select id="cfg-expiry">
+            <option value="3600000">1 小时</option>
+            <option value="86400000">1 天</option>
+            <option value="259200000">3 天</option>
+            <option value="0">永久</option>
+          </select>
+        </div>
+        <div class="span2">
+          <label>代理池（每行一个）</label>
+          <textarea id="cfg-proxy" placeholder="http://host:port&#10;host:port:user:pass"></textarea>
+        </div>
+        <div>
+          <label>代理用户名</label>
+          <input id="cfg-proxy-user" placeholder="可选" />
+        </div>
+        <div>
+          <label>代理密码</label>
+          <input id="cfg-proxy-pass" type="password" placeholder="可选" />
+        </div>
+        <div>
+          <label>代理策略</label>
+          <select id="cfg-proxy-strategy">
+            <option value="round_robin">轮询</option>
+            <option value="random">随机</option>
+            <option value="sticky">固定首个</option>
+          </select>
+        </div>
+      </div>
+      <div class="actions">
+        <button class="btn" id="btn-save-reg">保存配置</button>
+        <button class="btn btn-primary" id="btn-start">开始注册</button>
+        <button class="btn btn-danger" id="btn-stop">停止注册</button>
+        <button class="btn" id="btn-refresh">刷新进度</button>
+      </div>
+    </section>
+
+    <!-- Progress -->
+    <section class="card" id="progress-card">
+      <h2>运行进度</h2>
+      <p class="sub">切页不影响后台任务；成功账号会写入本地 data/ 并自动推送。</p>
+      <div class="kv"><span>状态</span><span class="tag" id="reg-status">idle</span></div>
+      <div class="kv"><span>会话 / 批次</span><code id="reg-id">—</code></div>
+      <div class="kv"><span>推送</span><code id="reg-push">—</code></div>
+      <pre class="log" id="reg-log">等待任务…</pre>
+    </section>
+
+    <!-- Local accounts cache -->
+    <section class="card">
+      <h2>本地账号缓存</h2>
+      <p class="sub">本机 file store 中的注册结果（主库在远端 grokcli-2api）。</p>
+      <div class="actions" style="margin-top:0">
+        <button class="btn" id="btn-reload-accounts">刷新列表</button>
+      </div>
+      <pre class="log" id="accounts-log" style="margin-top:12px">—</pre>
+    </section>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    let pollTimer = null;
+    let batchId = null;
+    let sessionId = null;
+    let sessionIds = [];
+
+    function toast(msg, ok = true) {
+      const el = $("toast");
+      el.textContent = msg;
+      el.classList.toggle("bad", !ok);
+      el.classList.remove("hidden");
+      setTimeout(() => el.classList.add("hidden"), 3200);
+    }
+
+    async function api(path, opts = {}) {
+      const r = await fetch(path, {
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json", ...(opts.headers || {}) },
+        ...opts,
+      });
+      let data = null;
+      try { data = await r.json(); } catch { data = { detail: await r.text() }; }
+      if (!r.ok) throw new Error(data.detail || data.error || `HTTP ${r.status}`);
+      return data;
+    }
+
+    function show(view) {
+      $("login-view").classList.toggle("hidden", view !== "login");
+      $("app-view").classList.toggle("hidden", view !== "app");
+    }
+
+    function currentMail() {
+      return ($("cfg-mail-provider").value || "yyds").toLowerCase();
+    }
+
+    function syncMailUi() {
+      const m = currentMail();
+      const needsBase = m === "moemail" || m === "cfmail";
+      $("wrap-base-url").classList.toggle("hidden", !needsBase);
+      $("lbl-base-url").textContent = m === "cfmail" ? "CFMail Base URL" : "MoeMail Base URL";
+      $("lbl-api-key").textContent =
+        m === "yyds" ? "YYDS API Key" :
+        m === "gptmail" ? "GPTMail API Key" :
+        m === "cfmail" ? "CFMail API Key" : "MoeMail API Key";
+      $("lbl-domain").textContent = "邮箱域名（" + m + "）";
+    }
+
+    function syncCaptchaUi() {
+      const c = ($("cfg-captcha").value || "local").toLowerCase();
+      $("wrap-yescaptcha").classList.toggle("hidden", c !== "yescaptcha");
+    }
+
+    function applyConfig(cfg) {
+      if (!cfg) return;
+      $("cfg-push-url").value = cfg.grokcli2api_admin_url || "";
+      $("cfg-push-token").value = "";
+      $("cfg-push-token").placeholder = cfg.has_grokcli2api_admin_token ? "********（已配置，留空保持）" : "Admin Token";
+      $("cfg-push-source").value = cfg.grokcli2api_push_source || "standalone-registration";
+      $("cfg-auto-push").checked = !!cfg.grokcli2api_auto_push;
+
+      const mail = (cfg.mail_provider || "yyds").toLowerCase();
+      $("cfg-mail-provider").value = ["yyds","moemail","gptmail","cfmail"].includes(mail) ? mail : "yyds";
+      if (mail === "moemail") {
+        $("cfg-base-url").value = cfg.moemail_base_url || "";
+        $("cfg-domain").value = cfg.moemail_domain || "";
+        $("cfg-api-key").placeholder = cfg.has_moemail_api_key ? "********（已配置）" : "MoeMail API Key";
+      } else if (mail === "cfmail") {
+        $("cfg-base-url").value = cfg.cfmail_base_url || "";
+        $("cfg-domain").value = cfg.cfmail_domain || "";
+        $("cfg-api-key").placeholder = cfg.has_cfmail_api_key ? "********（已配置）" : "CFMail API Key";
+      } else if (mail === "gptmail") {
+        $("cfg-domain").value = cfg.gptmail_domain || "";
+        $("cfg-api-key").placeholder = cfg.has_gptmail_api_key ? "********（已配置）" : "GPTMail API Key";
+      } else {
+        $("cfg-domain").value = cfg.yyds_domain || "";
+        $("cfg-api-key").placeholder = cfg.has_yyds_api_key ? "********（已配置）" : "YYDS API Key";
+      }
+      $("cfg-api-key").value = "";
+
+      $("cfg-captcha").value = (cfg.captcha_provider || "local") === "yescaptcha" ? "yescaptcha" : "local";
+      $("cfg-yescaptcha").value = "";
+      $("cfg-yescaptcha").placeholder = cfg.has_yescaptcha_key ? "********（已配置）" : "YesCaptcha Key";
+
+      $("cfg-count").value = cfg.count || 1;
+      $("cfg-concurrency").value = cfg.concurrency || 3;
+      $("cfg-stagger").value = cfg.stagger_ms || 300;
+      $("cfg-expiry").value = String(cfg.expiry_ms != null ? cfg.expiry_ms : 3600000);
+      $("cfg-proxy").value = cfg.proxy || "";
+      $("cfg-proxy-user").value = cfg.proxy_username || "";
+      $("cfg-proxy-pass").value = "";
+      $("cfg-proxy-pass").placeholder = cfg.has_proxy_password ? "********（已配置）" : "可选";
+      $("cfg-proxy-strategy").value = cfg.proxy_strategy || "round_robin";
+
+      syncMailUi();
+      syncCaptchaUi();
+    }
+
+    function readRegBody() {
+      const mail = currentMail();
+      const body = {
+        mail_provider: mail,
+        captcha_provider: $("cfg-captcha").value,
+        count: Number($("cfg-count").value || 1),
+        concurrency: Number($("cfg-concurrency").value || 3),
+        stagger_ms: Number($("cfg-stagger").value || 300),
+        expiry_ms: Number($("cfg-expiry").value || 3600000),
+        proxy: $("cfg-proxy").value,
+        proxy_username: $("cfg-proxy-user").value,
+        proxy_strategy: $("cfg-proxy-strategy").value,
+        probe_delay_sec: 0,
+        save_config: true,
+      };
+      if ($("cfg-api-key").value.trim()) body.api_key = $("cfg-api-key").value.trim();
+      if ($("cfg-domain").value.trim()) body.domain = $("cfg-domain").value.trim();
+      if ((mail === "moemail" || mail === "cfmail") && $("cfg-base-url").value.trim()) {
+        body.base_url = $("cfg-base-url").value.trim();
+      }
+      if ($("cfg-captcha").value === "yescaptcha" && $("cfg-yescaptcha").value.trim()) {
+        body.yescaptcha_key = $("cfg-yescaptcha").value.trim();
+      }
+      if ($("cfg-proxy-pass").value.trim()) body.proxy_password = $("cfg-proxy-pass").value.trim();
+      return body;
+    }
+
+    async function savePush() {
+      const patch = {
+        grokcli2api_admin_url: $("cfg-push-url").value.trim(),
+        grokcli2api_push_source: $("cfg-push-source").value.trim() || "standalone-registration",
+        grokcli2api_auto_push: $("cfg-auto-push").checked,
+      };
+      if ($("cfg-push-token").value.trim()) {
+        patch.grokcli2api_admin_token = $("cfg-push-token").value.trim();
+      }
+      const r = await api("/api/config", { method: "PUT", body: JSON.stringify(patch) });
+      applyConfig(r.config);
+      toast(r.message || "已保存");
+    }
+
+    async function saveReg() {
+      const body = readRegBody();
+      // expand into durable fields
+      const patch = {
+        mail_provider: body.mail_provider,
+        captcha_provider: body.captcha_provider,
+        count: body.count,
+        concurrency: body.concurrency,
+        stagger_ms: body.stagger_ms,
+        expiry_ms: body.expiry_ms,
+        proxy: body.proxy,
+        proxy_username: body.proxy_username,
+        proxy_strategy: body.proxy_strategy,
+      };
+      if (body.proxy_password) patch.proxy_password = body.proxy_password;
+      if (body.yescaptcha_key) patch.yescaptcha_key = body.yescaptcha_key;
+      if (body.api_key) {
+        const map = { yyds: "yyds_api_key", moemail: "moemail_api_key", gptmail: "gptmail_api_key", cfmail: "cfmail_api_key" };
+        patch[map[body.mail_provider] || "moemail_api_key"] = body.api_key;
+      }
+      if (body.domain != null) {
+        const dmap = { yyds: "yyds_domain", moemail: "moemail_domain", gptmail: "gptmail_domain", cfmail: "cfmail_domain" };
+        patch[dmap[body.mail_provider] || "moemail_domain"] = body.domain;
+      }
+      if (body.base_url) {
+        if (body.mail_provider === "moemail") patch.moemail_base_url = body.base_url;
+        if (body.mail_provider === "cfmail") patch.cfmail_base_url = body.base_url;
+      }
+      const r = await api("/api/config", { method: "PUT", body: JSON.stringify(patch) });
+      applyConfig(r.config);
+      toast("注册配置已保存");
+    }
+
+    function setStatus(text, cls) {
+      const el = $("reg-status");
+      el.textContent = text || "idle";
+      el.className = "tag" + (cls ? " " + cls : "");
+    }
+
+    function appendLog(lines) {
+      const el = $("reg-log");
+      if (Array.isArray(lines)) el.textContent = lines.join("\n");
+      else el.textContent = String(lines || "");
+    }
+
+    function stopPolling() {
+      if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    }
+
+    function startPolling() {
+      stopPolling();
+      pollTimer = setInterval(() => refreshProgress().catch(() => {}), 1500);
+      refreshProgress().catch(() => {});
+    }
+
+    async function refreshProgress() {
+      if (batchId) {
+        const b = await api("/api/batches/" + encodeURIComponent(batchId));
+        setStatus(b.status || b.state || "running", b.status === "done" || b.status === "finished" ? "ok" : "");
+        $("reg-id").textContent = `batch ${batchId}`;
+        const logs = [];
+        logs.push(`batch=${batchId} status=${b.status || b.state || "?"}`);
+        logs.push(`total=${b.total ?? b.count ?? "?"} finished=${b.finished ?? "?"} success=${b.success ?? "?"} fail=${b.fail ?? b.failed ?? "?"}`);
+        if (b.message) logs.push(`message: ${b.message}`);
+        const sessions = b.sessions || b.session_ids || [];
+        if (Array.isArray(sessions) && sessions.length) {
+          logs.push("sessions: " + (sessions.map(s => typeof s === "string" ? s : (s.id || s.session_id)).join(", ")));
+        }
+        // fetch a few sessions for detail
+        const ids = (b.session_ids || sessionIds || []).slice(0, 8);
+        for (const sid of ids) {
+          try {
+            const s = await api("/api/sessions/" + encodeURIComponent(sid));
+            const push = s.auth_json && s.auth_json.grokcli2api_push;
+            logs.push(
+              `· ${sid.slice(0, 10)}…  ${s.status || s.state || "?"}  ${s.email || ""}  ${s.message || s.phase || ""}` +
+              (push ? `  push=${push.ok ? "ok" : (push.skipped ? "skip" : "fail")}` : "")
+            );
+            if (push) $("reg-push").textContent = push.ok ? `ok (${push.total || 0})` : (push.error || push.reason || "fail");
+          } catch (_) {}
+        }
+        appendLog(logs);
+        const st = String(b.status || b.state || "").toLowerCase();
+        if (["done", "finished", "stopped", "failed", "error", "complete", "completed"].includes(st)) {
+          stopPolling();
+          loadAccounts().catch(() => {});
+        }
+        return;
+      }
+      if (sessionId) {
+        const s = await api("/api/sessions/" + encodeURIComponent(sessionId));
+        setStatus(s.status || s.state || "running");
+        $("reg-id").textContent = sessionId;
+        const push = s.auth_json && s.auth_json.grokcli2api_push;
+        if (push) $("reg-push").textContent = push.ok ? `ok (${push.total || 0})` : (push.error || push.reason || "fail");
+        appendLog([
+          `session=${sessionId}`,
+          `status=${s.status || s.state}`,
+          `email=${s.email || "—"}`,
+          `phase=${s.phase || s.message || "—"}`,
+          push ? `push=${JSON.stringify(push)}` : "push=—",
+          s.error ? `error=${s.error}` : "",
+        ].filter(Boolean));
+        const st = String(s.status || s.state || "").toLowerCase();
+        if (["done", "finished", "stopped", "failed", "error", "success", "complete", "completed"].includes(st)) {
+          stopPolling();
+          loadAccounts().catch(() => {});
+        }
+      }
+    }
+
+    async function startReg() {
+      $("btn-start").disabled = true;
+      try {
+        const body = readRegBody();
+        const r = await api("/api/register", {
+          method: "POST",
+          body: JSON.stringify(body),
+          headers: { "Idempotency-Key": "ui-" + Date.now() },
+        });
+        batchId = r.batch_id || null;
+        sessionId = r.id || r.session_id || (Array.isArray(r.session_ids) ? r.session_ids[0] : null);
+        sessionIds = Array.isArray(r.session_ids) ? r.session_ids.slice() : (sessionId ? [sessionId] : []);
+        setStatus("starting");
+        $("reg-id").textContent = batchId || sessionId || "—";
+        $("reg-push").textContent = "—";
+        appendLog([
+          "[start] 注册已启动",
+          `count=${r.count || body.count}`,
+          `concurrency=${r.concurrency || body.concurrency}`,
+          `batch_id=${batchId || "—"}`,
+          `session_ids=${sessionIds.join(", ") || "—"}`,
+          `message=${r.message || "ok"}`,
+        ]);
+        toast(r.message || "已启动");
+        startPolling();
+      } catch (e) {
+        toast(e.message, false);
+      } finally {
+        $("btn-start").disabled = false;
+      }
+    }
+
+    async function stopReg() {
+      try {
+        if (batchId) {
+          await api("/api/batches/" + encodeURIComponent(batchId) + "/stop", { method: "POST", body: "{}" });
+        } else if (sessionId) {
+          await api("/api/sessions/" + encodeURIComponent(sessionId) + "/stop", { method: "POST", body: "{}" });
+        } else {
+          await api("/api/stop", { method: "POST", body: "{}" });
+        }
+        toast("已发送停止");
+        refreshProgress().catch(() => {});
+      } catch (e) {
+        toast(e.message, false);
+      }
+    }
+
+    async function loadAccounts() {
+      try {
+        const r = await api("/api/accounts");
+        const lines = [`count=${r.count || 0}`];
+        (r.accounts || []).slice(0, 50).forEach((a) => {
+          lines.push(`${a.email || a.id || "?"}  expired=${!!a.expired}  source=${a.source || "—"}  sso=${a.has_sso ? "yes" : "no"}`);
+        });
+        if ((r.accounts || []).length > 50) lines.push(`… +${r.accounts.length - 50} more`);
+        $("accounts-log").textContent = lines.join("\n") || "—";
+      } catch (e) {
+        $("accounts-log").textContent = e.message;
+      }
+    }
+
+    async function refreshHealth() {
+      try {
+        const h = await fetch("/health").then((r) => r.json());
+        const el = $("health-tag");
+        if (h.adapter_ok) {
+          el.textContent = `ready · ${h.mail_provider || "?"} · captcha=${h.captcha_provider}`;
+          el.className = "tag ok";
+        } else {
+          el.textContent = "adapter error";
+          el.className = "tag bad";
+        }
+      } catch {
+        $("health-tag").textContent = "offline";
+        $("health-tag").className = "tag bad";
+      }
+    }
+
+    async function boot() {
+      try {
+        const me = await api("/api/me");
+        if (!me.authenticated) {
+          show("login");
+          return;
+        }
+        show("app");
+        const cfg = await api("/api/config");
+        applyConfig(cfg.config);
+        await refreshHealth();
+        await loadAccounts();
+      } catch {
+        show("login");
+      }
+    }
+
+    $("btn-login").onclick = async () => {
+      try {
+        await api("/api/login", {
+          method: "POST",
+          body: JSON.stringify({ password: $("login-password").value }),
+        });
+        toast("登录成功");
+        boot();
+      } catch (e) {
+        toast(e.message, false);
+      }
+    };
+    $("login-password").addEventListener("keydown", (e) => {
+      if (e.key === "Enter") $("btn-login").click();
+    });
+    $("btn-logout").onclick = async () => {
+      stopPolling();
+      await api("/api/logout", { method: "POST", body: "{}" });
+      show("login");
+    };
+    $("cfg-mail-provider").onchange = syncMailUi;
+    $("cfg-captcha").onchange = syncCaptchaUi;
+    $("btn-save-push").onclick = () => savePush().catch((e) => toast(e.message, false));
+    $("btn-save-reg").onclick = () => saveReg().catch((e) => toast(e.message, false));
+    $("btn-test-push").onclick = async () => {
+      try {
+        // save url first if filled
+        if ($("cfg-push-url").value.trim() || $("cfg-push-token").value.trim()) {
+          await savePush();
+        }
+        const r = await api("/api/push/test", { method: "POST", body: "{}" });
+        toast(r.message || (r.ok ? "连通正常" : r.error || "失败"), !!r.ok);
+      } catch (e) {
+        toast(e.message, false);
+      }
+    };
+    $("btn-start").onclick = () => startReg();
+    $("btn-stop").onclick = () => stopReg();
+    $("btn-refresh").onclick = () => refreshProgress().catch((e) => toast(e.message, false));
+    $("btn-reload-accounts").onclick = () => loadAccounts().catch((e) => toast(e.message, false));
+
+    boot();
+  </script>
+</body>
+</html>

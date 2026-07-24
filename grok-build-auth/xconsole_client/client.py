@@ -901,6 +901,7 @@ class XConsoleAuthClient:
         turnstile_token: str,
         referer: str | None = None,
         retries: int = 3,
+        detail: dict | None = None,
     ) -> Optional[str]:
         """Fallback when create_account returns no SSO cookie chain.
 
@@ -908,6 +909,11 @@ class XConsoleAuthClient:
         inline set-cookie JWT. In that case we can still log in with the just
         created email/password via AuthManagement/CreateSession and treat the
         returned session JWT as the ``sso`` cookie value for sso_to_auth_json.
+
+        ``detail`` (optional out-dict): when provided, failure diagnostics are
+        written into it (``last_status`` / ``grpc_status`` / ``grpc_msg`` /
+        ``reason``) so callers can distinguish a wrong-password rejection from a
+        transient failure (rate limit / account still propagating / turnstile).
         """
         import time as _time
         from urllib.parse import unquote
@@ -1067,7 +1073,28 @@ class XConsoleAuthClient:
                 f"  [sso] CreateSession exhausted status={last_status} "
                 f"grpc={last_grpc} msg={last_msg!r}"
             )
-        return self._read_sso_from_jar()
+        jar_sso = self._read_sso_from_jar()
+        if isinstance(detail, dict):
+            detail["last_status"] = last_status
+            detail["grpc_status"] = last_grpc
+            detail["grpc_msg"] = last_msg
+            low = str(last_msg or "").lower()
+            # grpc_status 7 = PERMISSION_DENIED / 16 = UNAUTHENTICATED; xAI returns
+            # an "invalid-credentials" message when the password is wrong. Anything
+            # else (rate limit, NOT_FOUND while propagating, turnstile, network) is
+            # transient and must NOT be treated as a wrong password.
+            if not jar_sso and (
+                "invalid-credentials" in low
+                or "invalid credentials" in low
+                or "incorrect password" in low
+                or "wrong password" in low
+            ):
+                detail["reason"] = "wrong_password"
+            elif jar_sso:
+                detail["reason"] = "ok"
+            else:
+                detail["reason"] = "transient"
+        return jar_sso
 
     def close(self):
         self._t.close()

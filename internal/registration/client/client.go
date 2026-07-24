@@ -101,6 +101,40 @@ func (c *Client) SSOImportJob(ctx context.Context, jobID string) (map[string]any
 	return c.doAbsolute(ctx, http.MethodGet, "/internal/sso/v1/jobs/"+url.PathEscape(jobID), nil, nil)
 }
 
+// Origin SSO recovery (data/origin_sso/*.json → reauth / import)
+
+func (c *Client) OriginSSOScan(ctx context.Context) (map[string]any, error) {
+	return c.doAbsolute(ctx, http.MethodGet, "/internal/origin-sso/v1/scan", nil, nil)
+}
+
+func (c *Client) OriginSSOPreview(ctx context.Context, request map[string]any) (map[string]any, error) {
+	return c.doAbsolute(ctx, http.MethodPost, "/internal/origin-sso/v1/preview", request, nil)
+}
+
+func (c *Client) OriginSSOStart(ctx context.Context, request map[string]any) (map[string]any, error) {
+	return c.doAbsolute(ctx, http.MethodPost, "/internal/origin-sso/v1/start", request, nil)
+}
+
+func (c *Client) OriginSSOBatch(ctx context.Context, batchID string) (map[string]any, error) {
+	return c.doAbsolute(ctx, http.MethodGet, "/internal/origin-sso/v1/batches/"+url.PathEscape(batchID), nil, nil)
+}
+
+func (c *Client) OriginSSOStopBatch(ctx context.Context, batchID string) (map[string]any, error) {
+	return c.doAbsolute(ctx, http.MethodPost, "/internal/origin-sso/v1/batches/"+url.PathEscape(batchID)+"/stop", map[string]any{}, nil)
+}
+
+func (c *Client) OriginSSOSession(ctx context.Context, sessionID string) (map[string]any, error) {
+	return c.doAbsolute(ctx, http.MethodGet, "/internal/origin-sso/v1/sessions/"+url.PathEscape(sessionID), nil, nil)
+}
+
+func (c *Client) OriginSSOSessions(ctx context.Context, batchID string) (map[string]any, error) {
+	path := "/internal/origin-sso/v1/sessions"
+	if strings.TrimSpace(batchID) != "" {
+		path += "?batch_id=" + url.QueryEscape(batchID)
+	}
+	return c.doAbsolute(ctx, http.MethodGet, path, nil, nil)
+}
+
 func (c *Client) do(ctx context.Context, method, path string, body any, headers http.Header) (map[string]any, error) {
 	return c.doAbsolute(ctx, method, "/internal/registration/"+APIVersion+path, body, headers)
 }

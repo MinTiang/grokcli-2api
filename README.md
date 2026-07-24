@@ -2,7 +2,7 @@
 
 把 **Grok OIDC 登录态** 转成 **OpenAI / Anthropic 兼容 API**，并附带 Web 管理台：多 API Key、多账号轮询、设备码 / SSO / JSON 导入导出、协议注册。
 
-**当前版本：v2.0.4** · 容器内热更新 · API Key 列表修复 · 注册资源/日志优化 · empty-output 治理 · Go 主进程
+**当前版本：v2.1.0** · Origin SSO 恢复（账密换 SSO）· 容器内热更新 · API Key 列表修复 · 注册资源/日志优化 · Go 主进程
 
 [![GHCR](https://img.shields.io/badge/ghcr.io-hm2899%2Fgrokcli--2api-blue)](https://github.com/users/HM2899/packages/container/package/grokcli-2api)
 [![Release](https://img.shields.io/github/v/release/HM2899/grokcli-2api?display_name=tag)](https://github.com/HM2899/grokcli-2api/releases)

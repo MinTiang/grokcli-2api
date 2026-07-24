@@ -1,0 +1,50 @@
+# Standalone registration service
+# Build context MUST be the parent grokcli-2api repo root:
+#   docker compose -f standalone-registration/docker-compose.yml up -d --build
+#
+# Or from this directory:
+#   docker compose up -d --build
+
+services:
+  registration:
+    build:
+      context: ..
+      dockerfile: standalone-registration/Dockerfile
+    image: grok-standalone-registration:latest
+    container_name: grok-registration
+    ports:
+      - "${REG_UI_PORT:-8080}:8080"
+    # Create .env from .env.example first (optional; page can set secrets too)
+    env_file:
+      - .env
+    environment:
+      REG_UI_HOST: "0.0.0.0"
+      REG_UI_PORT: "8080"
+      GROK2API_DATA_DIR: /app/data
+      GROK2API_STORE_BACKEND: file
+      GROK2API_REG_SKIP_PROBE: "1"
+      GROK2API_CAPTCHA_PROVIDER: ${GROK2API_CAPTCHA_PROVIDER:-local}
+      GROK2API_INLINE_SOLVER: ${GROK2API_INLINE_SOLVER:-1}
+      TURNSTILE_PORT: "5072"
+      TURNSTILE_THREAD: ${TURNSTILE_THREAD:-3}
+      # Optional redis for session durability across restarts
+      # REDIS_URL: redis://redis:6379/1
+    volumes:
+      - registration_data:/app/data
+      - registration_solver_logs:/app/turnstile-solver/logs
+    restart: unless-stopped
+    # depends_on:
+    #   - redis
+
+  # Uncomment if you want Redis-backed registration session state
+  # redis:
+  #   image: redis:7-alpine
+  #   command: redis-server --save "" --appendonly no
+  #   volumes:
+  #     - registration_redis:/data
+  #   restart: unless-stopped
+
+volumes:
+  registration_data:
+  registration_solver_logs:
+  # registration_redis:
